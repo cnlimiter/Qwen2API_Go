@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -9,6 +10,8 @@ import (
 	"strings"
 	"testing"
 
+	"qwen2api/internal/account"
+	"qwen2api/internal/config"
 	"qwen2api/internal/logging"
 	"qwen2api/internal/metrics"
 	"qwen2api/internal/toolcall"
@@ -283,9 +286,9 @@ func TestNormalizeResponseToolsAvoidsSyntheticNameCollisions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("normalizeResponseTools() error = %v", err)
 	}
-	publicFunctionName := registry.internalName(responseToolFunction, "freeform")
-	collisionFunctionName := registry.internalName(responseToolFunction, "__responses_custom_1")
-	customName := registry.internalName(responseToolCustom, "freeform")
+	publicFunctionName := registry.internalName(responseToolFunction, "", "freeform")
+	collisionFunctionName := registry.internalName(responseToolFunction, "", "__responses_custom_1")
+	customName := registry.internalName(responseToolCustom, "", "freeform")
 	if publicFunctionName != "freeform" || customName != "__responses_custom_1_1" || collisionFunctionName == customName {
 		t.Fatalf("collision mapping = public function:%q collision function:%q custom:%q", publicFunctionName, collisionFunctionName, customName)
 	}
@@ -562,6 +565,174 @@ func TestNormalizeResponseToolsValidatesCustomFormats(t *testing.T) {
 	}
 }
 
+func TestNormalizeResponseNamespaceSupportsFunctionAndCustomMembers(t *testing.T) {
+	rawNamespace := responseNamespaceRawTool(t)
+	chatTools, responseTools, registry, err := normalizeResponseTools([]json.RawMessage{rawNamespace})
+	if err != nil {
+		t.Fatalf("normalizeResponseTools() error = %v", err)
+	}
+	if len(chatTools) != 2 || len(responseTools) != 1 || len(registry.definitions) != 2 {
+		t.Fatalf("namespace normalization lengths = chat:%d response:%d definitions:%d", len(chatTools), len(responseTools), len(registry.definitions))
+	}
+	function := registry.byTypeName[responseToolKey(responseToolFunction, "github", "get_issue")]
+	custom := registry.byTypeName[responseToolKey(responseToolCustom, "github", "query")]
+	if function.Namespace != "github" || function.Name != "get_issue" || function.InternalName == "get_issue" {
+		t.Fatalf("function namespace mapping = %#v", function)
+	}
+	if custom.Namespace != "github" || custom.Name != "query" || custom.InternalName == "query" || custom.InternalName == function.InternalName {
+		t.Fatalf("custom namespace mapping = %#v", custom)
+	}
+	echoedMembers := responseTools[0]["tools"].([]any)
+	if responseTools[0]["type"] != "namespace" || responseTools[0]["name"] != "github" || len(echoedMembers) != 2 {
+		t.Fatalf("namespace echo = %#v", responseTools[0])
+	}
+	if echoedMembers[0].(map[string]any)["defer_loading"] != true || echoedMembers[1].(map[string]any)["format"] == nil {
+		t.Fatalf("namespace member echo lost semantic fields: %#v", echoedMembers)
+	}
+}
+
+func TestNormalizeResponseNamespaceRejectsMalformedDefinitions(t *testing.T) {
+	tests := []struct {
+		name string
+		tool map[string]any
+	}{
+		{name: "missing namespace name", tool: map[string]any{"type": "namespace", "description": "tools", "tools": []any{map[string]any{"type": "function", "name": "f", "parameters": map[string]any{"type": "object"}}}}},
+		{name: "empty members", tool: map[string]any{"type": "namespace", "name": "apps", "description": "tools", "tools": []any{}}},
+		{name: "unsupported member", tool: map[string]any{"type": "namespace", "name": "apps", "description": "tools", "tools": []any{map[string]any{"type": "shell"}}}},
+		{name: "function parameters not object", tool: map[string]any{"type": "namespace", "name": "apps", "description": "tools", "tools": []any{map[string]any{"type": "function", "name": "f", "parameters": "object"}}}},
+		{name: "custom format invalid", tool: map[string]any{"type": "namespace", "name": "apps", "description": "tools", "tools": []any{map[string]any{"type": "custom", "name": "c", "format": map[string]any{"type": "grammar", "syntax": "peg", "definition": "x"}}}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, _, _, err := normalizeResponseTools(responseRawTools(t, tt.tool)); err == nil {
+				t.Fatal("normalizeResponseTools() error = nil, want malformed namespace error")
+			}
+		})
+	}
+}
+
+func TestResponseNamespaceMembersRoundTrip(t *testing.T) {
+	_, _, registry, err := normalizeResponseTools([]json.RawMessage{responseNamespaceRawTool(t)})
+	if err != nil {
+		t.Fatalf("normalizeResponseTools() error = %v", err)
+	}
+	input := json.RawMessage(`[
+		{"type":"function_call","call_id":"call_f","namespace":"github","name":"get_issue","arguments":"{\"number\":42}"},
+		{"type":"function_call_output","call_id":"call_f","output":"issue"},
+		{"type":"custom_tool_call","call_id":"call_c","namespace":"github","name":"query","input":"is:open"},
+		{"type":"custom_tool_call_output","call_id":"call_c","output":"results"}
+	]`)
+	messages, err := normalizeResponseInputWithTools(input, registry)
+	if err != nil {
+		t.Fatalf("normalizeResponseInputWithTools() error = %v", err)
+	}
+	if len(messages) != 4 {
+		t.Fatalf("messages len = %d, want 4", len(messages))
+	}
+	for index := 0; index < len(messages); index += 2 {
+		call := messages[index]["tool_calls"].([]any)[0].(map[string]any)
+		function := call["function"].(map[string]any)
+		internalName := function["name"]
+		if messages[index+1]["name"] != internalName || messages[index+1]["tool_call_id"] != call["id"] {
+			t.Fatalf("namespace round trip pair %d mismatch: call=%#v output=%#v", index/2, messages[index], messages[index+1])
+		}
+		if index == 2 && function["arguments"] != `{"input":"is:open"}` {
+			t.Fatalf("namespace custom input arguments = %q", function["arguments"])
+		}
+	}
+
+	functionDefinition := registry.byTypeName[responseToolKey(responseToolFunction, "github", "get_issue")]
+	customDefinition := registry.byTypeName[responseToolKey(responseToolCustom, "github", "query")]
+	outputs, err := responseToolOutputs([]toolcall.ToolCall{
+		{Name: functionDefinition.InternalName, Input: map[string]any{"number": 42}},
+		{Name: customDefinition.InternalName, Input: map[string]any{"input": "is:open"}},
+	}, []toolcall.ToolSchema{
+		{Name: functionDefinition.InternalName, Parameters: map[string]any{"type": "object", "properties": map[string]any{"number": map[string]any{"type": "integer"}}}},
+		{Name: customDefinition.InternalName, Parameters: responseCustomParameters()},
+	}, registry.definitions)
+	if err != nil {
+		t.Fatalf("responseToolOutputs() error = %v", err)
+	}
+	if outputs[0]["type"] != "function_call" || outputs[0]["namespace"] != "github" || outputs[0]["name"] != "get_issue" {
+		t.Fatalf("namespace function output = %#v", outputs[0])
+	}
+	if outputs[1]["type"] != "custom_tool_call" || outputs[1]["namespace"] != "github" || outputs[1]["name"] != "query" {
+		t.Fatalf("namespace custom output = %#v", outputs[1])
+	}
+}
+
+func TestResponseNamespaceStreamPreservesNamespace(t *testing.T) {
+	chatTools, responseTools, registry, err := normalizeResponseTools([]json.RawMessage{responseNamespaceRawTool(t)})
+	if err != nil {
+		t.Fatalf("normalizeResponseTools() error = %v", err)
+	}
+	definition := registry.byTypeName[responseToolKey(responseToolFunction, "github", "get_issue")]
+	content := fmt.Sprintf("<ml_tool_calls><ml_tool_call><ml_tool_name>%s</ml_tool_name><ml_parameters><number><![CDATA[42]]></number></ml_parameters></ml_tool_call></ml_tool_calls>", definition.InternalName)
+	delta, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{"delta": map[string]any{"content": content}}}})
+	recorder := httptest.NewRecorder()
+	responseTestHandler().handleResponseStream(recorder, strings.NewReader(fmt.Sprintf("data: %s\n\ndata: [DONE]\n\n", delta)), responseContext{
+		ID: "resp_namespace", CreatedAt: 123, Model: "qwen3", Metadata: map[string]any{}, ParallelToolCalls: true,
+		ToolChoice: "auto", Tools: responseTools, ToolDefinitions: registry.definitions,
+	}, "qwen3", responseToolNames(registry.definitions), responseSchemas(chatTools), 1)
+	events := decodeResponseEvents(t, recorder.Body.String())
+	assertResponseEventTypes(t, events, []string{
+		"response.created", "response.in_progress", "response.output_item.added", "response.function_call_arguments.delta",
+		"response.function_call_arguments.done", "response.output_item.done", "response.completed",
+	})
+	done := events[5]["item"].(map[string]any)
+	completed := events[6]["response"].(map[string]any)["output"].([]any)[0].(map[string]any)
+	if done["namespace"] != "github" || done["name"] != "get_issue" || !reflect.DeepEqual(done, completed) {
+		t.Fatalf("namespace stream output mismatch: done=%#v completed=%#v", done, completed)
+	}
+}
+
+func TestForcedFunctionChoiceSurvivesIncrementalPreparation(t *testing.T) {
+	tools := responseRawTools(t, map[string]any{
+		"type": "function", "name": "weather", "description": "Get weather",
+		"parameters": map[string]any{"type": "object", "properties": map[string]any{"city": map[string]any{"type": "string"}}, "required": []any{"city"}},
+	})
+	for name, toolChoice := range map[string]any{
+		"required": "required",
+		"explicit": map[string]any{"type": "function", "name": "weather"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			request := responsesRequest{Model: "qwen3", Input: json.RawMessage(`"weather in Hangzhou"`), Tools: tools, ToolChoice: toolChoice}
+			normalized, err := normalizeResponsesRequest(request)
+			if err != nil {
+				t.Fatalf("normalizeResponsesRequest() error = %v", err)
+			}
+			logger := logging.New(false)
+			accounts := account.NewService(config.Config{}, nil, nil, nil, logger)
+			handler := &Handler{accounts: accounts, logger: logger}
+			prepared := handler.prepareChatRequest(context.Background(), executedChatRequest{
+				Model: "qwen3", Messages: normalized.Messages, Tools: normalized.ChatTools, ToolChoice: normalized.ChatToolChoice,
+			})
+			if len(prepared.LastUpstreamMessages) != 1 {
+				t.Fatalf("last upstream messages len = %d, want 1", len(prepared.LastUpstreamMessages))
+			}
+			lastContent := extractText(prepared.LastUpstreamMessages[0]["content"])
+			if !strings.Contains(lastContent, "[ml_tool reminder]") || !strings.Contains(lastContent, "weather") || !strings.Contains(lastContent, "must call") {
+				t.Fatalf("forced tool reminder did not reach incremental message: %q", lastContent)
+			}
+
+			upstream := `{"choices":[{"message":{"role":"assistant","content":"<ml_tool_calls><ml_tool_call><ml_tool_name>weather</ml_tool_name><ml_parameters><city><![CDATA[Hangzhou]]></city></ml_parameters></ml_tool_call></ml_tool_calls>"}}]}`
+			recorder := httptest.NewRecorder()
+			handler.handleResponseNonStream(recorder, strings.NewReader(upstream), newResponseContext(request, normalized, "qwen3"),
+				"qwen3", responseToolNames(normalized.ToolDefinitions), responseSchemas(normalized.ChatTools), 1)
+			var response map[string]any
+			decodeJSONForTest(t, recorder.Body.String(), &response)
+			output := response["output"].([]any)
+			if len(output) != 1 {
+				t.Fatalf("output len = %d, want exactly one function call", len(output))
+			}
+			call := output[0].(map[string]any)
+			if call["type"] != "function_call" || call["name"] != "weather" || call["arguments"] != `{"city":"Hangzhou"}` {
+				t.Fatalf("forced function output = %#v", call)
+			}
+		})
+	}
+}
+
 func TestHandleResponsesInvalidInputErrorEnvelope(t *testing.T) {
 	handler := &Handler{}
 	recorder := httptest.NewRecorder()
@@ -626,6 +797,23 @@ func mixedResponseRawTools(t *testing.T) []json.RawMessage {
 	)
 }
 
+func responseNamespaceRawTool(t *testing.T) json.RawMessage {
+	t.Helper()
+	return responseRawTools(t, map[string]any{
+		"type": "namespace", "name": "github", "description": "GitHub tools",
+		"tools": []any{
+			map[string]any{
+				"type": "function", "name": "get_issue", "description": "Get an issue", "strict": false, "defer_loading": true,
+				"parameters": map[string]any{"type": "object", "properties": map[string]any{"number": map[string]any{"type": "integer"}}, "required": []any{"number"}},
+			},
+			map[string]any{
+				"type": "custom", "name": "query", "description": "Query issues", "defer_loading": false,
+				"format": map[string]any{"type": "grammar", "syntax": "regex", "definition": `^.+$`},
+			},
+		},
+	})[0]
+}
+
 func normalizeMixedResponseTools(t *testing.T) normalizedResponsesRequest {
 	t.Helper()
 	normalized, err := normalizeResponsesRequest(responsesRequest{
@@ -678,7 +866,7 @@ func registryFromDefinitions(definitions []responseToolDefinition) responseToolR
 		byTypeName:  make(map[string]responseToolDefinition, len(definitions)),
 	}
 	for _, definition := range definitions {
-		registry.byTypeName[responseToolKey(definition.Type, definition.Name)] = definition
+		registry.byTypeName[responseToolKey(definition.Type, definition.Namespace, definition.Name)] = definition
 	}
 	return registry
 }

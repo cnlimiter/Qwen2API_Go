@@ -32,11 +32,13 @@ const (
 	responseToolLocalShell = "local_shell"
 	responseToolShell      = "shell"
 	responseToolApplyPatch = "apply_patch"
+	responseToolNamespace  = "namespace"
 )
 
 type responseToolDefinition struct {
 	Type         string
 	Name         string
+	Namespace    string
 	InternalName string
 }
 
@@ -242,6 +244,10 @@ func normalizeResponseInputWithTools(raw json.RawMessage, registry responseToolR
 		case "function_call":
 			callID := strings.TrimSpace(stringValue(item["call_id"]))
 			name := strings.TrimSpace(stringValue(item["name"]))
+			namespace, err := optionalResponseString(item, "namespace")
+			if err != nil {
+				return nil, responseInputError(fmt.Sprintf("input[%d].namespace must be a string", index))
+			}
 			arguments, ok := item["arguments"].(string)
 			var decodedArguments map[string]any
 			if callID == "" || name == "" || !ok || json.Unmarshal([]byte(arguments), &decodedArguments) != nil {
@@ -250,19 +256,27 @@ func normalizeResponseInputWithTools(raw json.RawMessage, registry responseToolR
 			if _, exists := calls[callID]; exists {
 				return nil, responseInputError(fmt.Sprintf("input[%d].call_id is duplicated", index))
 			}
-			calls[callID] = responseInputToolCall{Type: responseToolFunction, InternalName: name}
-			messages = append(messages, responseAssistantToolMessage(callID, name, arguments))
+			internalName := registry.internalName(responseToolFunction, namespace, name)
+			if namespace != "" && internalName == "" {
+				return nil, responseInputError(fmt.Sprintf("input[%d] does not reference a provided function namespace member", index))
+			}
+			if internalName == "" {
+				internalName = name
+			}
+			calls[callID] = responseInputToolCall{Type: responseToolFunction, InternalName: internalName}
+			messages = append(messages, responseAssistantToolMessage(callID, internalName, arguments))
 		case "custom_tool_call":
 			callID, callIDErr := requiredResponseString(item["call_id"], "call_id")
 			name, nameErr := requiredResponseString(item["name"], "name")
+			namespace, namespaceErr := optionalResponseString(item, "namespace")
 			input, ok := item["input"].(string)
-			if callIDErr != nil || nameErr != nil || !ok {
+			if callIDErr != nil || nameErr != nil || namespaceErr != nil || !ok {
 				return nil, responseInputError(fmt.Sprintf("input[%d] has an invalid custom_tool_call", index))
 			}
 			if _, exists := calls[callID]; exists {
 				return nil, responseInputError(fmt.Sprintf("input[%d].call_id is duplicated", index))
 			}
-			internalName := registry.internalName(responseToolCustom, name)
+			internalName := registry.internalName(responseToolCustom, namespace, name)
 			if internalName == "" {
 				return nil, responseInputError(fmt.Sprintf("input[%d].name does not reference a provided custom tool", index))
 			}
@@ -345,7 +359,7 @@ func normalizeResponseNativeInputCall(index int, item map[string]any, toolType s
 	if err != nil {
 		return responseNativeInputCall{}, "", responseInputError(fmt.Sprintf("input[%d].call_id is required", index))
 	}
-	internalName := registry.internalName(toolType, toolType)
+	internalName := registry.internalName(toolType, "", toolType)
 	if internalName == "" {
 		return responseNativeInputCall{}, "", responseInputError(fmt.Sprintf("input[%d] references a %s tool that was not provided", index, toolType))
 	}
@@ -628,6 +642,18 @@ func requiredResponseStringAllowEmpty(raw any, field string) (string, error) {
 	return value, nil
 }
 
+func optionalResponseString(object map[string]any, field string) (string, error) {
+	raw, exists := object[field]
+	if !exists || raw == nil {
+		return "", nil
+	}
+	value, ok := raw.(string)
+	if !ok {
+		return "", fmt.Errorf("%s must be a string", field)
+	}
+	return strings.TrimSpace(value), nil
+}
+
 func validateResponseObjectKeys(object map[string]any, allowed ...string) error {
 	allowedKeys := make(map[string]struct{}, len(allowed))
 	for _, key := range allowed {
@@ -706,6 +732,17 @@ func normalizeResponseTools(tools []json.RawMessage) ([]any, []map[string]any, r
 		if isHostedResponseTool(toolType) {
 			return nil, nil, responseToolRegistry{}, responseToolError(fmt.Sprintf("tools[%d].type %q requires OpenAI-hosted execution, which this backend cannot provide", index, toolType))
 		}
+		if toolType == responseToolNamespace {
+			namespaceTools, err := normalizeResponseNamespace(tool, index, usedInternalNames, &registry)
+			if err != nil {
+				return nil, nil, responseToolRegistry{}, err
+			}
+			chatTools = append(chatTools, namespaceTools...)
+			echo := cloneMap(tool)
+			echo["type"] = toolType
+			responseTools = append(responseTools, echo)
+			continue
+		}
 
 		name := toolType
 		internalName := ""
@@ -768,7 +805,7 @@ func normalizeResponseTools(tools []json.RawMessage) ([]any, []map[string]any, r
 			return nil, nil, responseToolRegistry{}, responseToolError(fmt.Sprintf("tools[%d].type %q is not supported", index, toolType))
 		}
 
-		key := responseToolKey(toolType, name)
+		key := responseToolKey(toolType, "", name)
 		if _, exists := registry.byTypeName[key]; exists {
 			return nil, nil, responseToolRegistry{}, responseToolError(fmt.Sprintf("tools[%d] duplicates %s tool %q", index, toolType, name))
 		}
@@ -790,6 +827,142 @@ func normalizeResponseTools(tools []json.RawMessage) ([]any, []map[string]any, r
 		responseTools = append(responseTools, echo)
 	}
 	return chatTools, responseTools, registry, nil
+}
+
+func normalizeResponseNamespace(tool map[string]any, toolIndex int, usedInternalNames map[string]struct{}, registry *responseToolRegistry) ([]any, error) {
+	if err := validateResponseObjectKeys(tool, "type", "name", "description", "tools"); err != nil {
+		return nil, responseToolError(fmt.Sprintf("tools[%d] %v", toolIndex, err))
+	}
+	namespace, err := requiredResponseString(tool["name"], "name")
+	if err != nil {
+		return nil, responseToolError(fmt.Sprintf("tools[%d].name must be a non-empty string", toolIndex))
+	}
+	description, err := requiredResponseStringAllowEmpty(tool["description"], "description")
+	if err != nil {
+		return nil, responseToolError(fmt.Sprintf("tools[%d].description must be a string", toolIndex))
+	}
+	rawMembers, ok := tool["tools"].([]any)
+	if !ok || len(rawMembers) == 0 {
+		return nil, responseToolError(fmt.Sprintf("tools[%d].tools must be a non-empty array", toolIndex))
+	}
+
+	chatTools := make([]any, 0, len(rawMembers))
+	for memberIndex, rawMember := range rawMembers {
+		member, ok := rawMember.(map[string]any)
+		if !ok {
+			return nil, responseToolError(fmt.Sprintf("tools[%d].tools[%d] must be an object", toolIndex, memberIndex))
+		}
+		rawType, ok := member["type"].(string)
+		memberType := strings.ToLower(strings.TrimSpace(rawType))
+		if !ok || (memberType != responseToolFunction && memberType != responseToolCustom) {
+			return nil, responseToolError(fmt.Sprintf("tools[%d].tools[%d].type must be function or custom", toolIndex, memberIndex))
+		}
+		name, err := requiredResponseString(member["name"], "name")
+		if err != nil {
+			return nil, responseToolError(fmt.Sprintf("tools[%d].tools[%d].name must be a non-empty string", toolIndex, memberIndex))
+		}
+		key := responseToolKey(memberType, namespace, name)
+		if _, exists := registry.byTypeName[key]; exists {
+			return nil, responseToolError(fmt.Sprintf("tools[%d].tools[%d] duplicates %s member %q in namespace %q", toolIndex, memberIndex, memberType, name, namespace))
+		}
+
+		memberDescription := ""
+		if rawDescription, exists := member["description"]; exists {
+			memberDescription, ok = rawDescription.(string)
+			if !ok {
+				return nil, responseToolError(fmt.Sprintf("tools[%d].tools[%d].description must be a string", toolIndex, memberIndex))
+			}
+		}
+		var parameters map[string]any
+		switch memberType {
+		case responseToolFunction:
+			if err := validateResponseNamespaceFunction(member); err != nil {
+				return nil, responseToolError(fmt.Sprintf("tools[%d].tools[%d] %v", toolIndex, memberIndex, err))
+			}
+			parameters, _ = member["parameters"].(map[string]any)
+		case responseToolCustom:
+			formatDescription, err := validateResponseNamespaceCustom(member)
+			if err != nil {
+				return nil, responseToolError(fmt.Sprintf("tools[%d].tools[%d] %v", toolIndex, memberIndex, err))
+			}
+			memberDescription = strings.TrimSpace(strings.Join([]string{memberDescription, formatDescription}, "\n"))
+			parameters = responseCustomParameters()
+		}
+
+		internalName := nextResponseInternalName(fmt.Sprintf("namespace_%d_%s", toolIndex, memberType), memberIndex, usedInternalNames)
+		definition := responseToolDefinition{Type: memberType, Name: name, Namespace: namespace, InternalName: internalName}
+		registry.definitions = append(registry.definitions, definition)
+		registry.byTypeName[key] = definition
+		usedInternalNames[internalName] = struct{}{}
+		chatTools = append(chatTools, map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        internalName,
+				"description": fmt.Sprintf("Namespace %s: %s\n%s", namespace, description, memberDescription),
+				"parameters":  parameters,
+			},
+		})
+	}
+	return chatTools, nil
+}
+
+func validateResponseNamespaceFunction(member map[string]any) error {
+	if err := validateResponseObjectKeys(member, "type", "name", "description", "strict", "defer_loading", "parameters", "output_schema", "allowed_callers"); err != nil {
+		return err
+	}
+	parameters, ok := member["parameters"].(map[string]any)
+	if !ok || parameters == nil {
+		return errors.New("parameters must be an object")
+	}
+	for _, field := range []string{"strict", "defer_loading"} {
+		if raw, exists := member[field]; exists {
+			if _, ok := raw.(bool); !ok {
+				return fmt.Errorf("%s must be a boolean", field)
+			}
+		}
+	}
+	if raw, exists := member["output_schema"]; exists {
+		if _, ok := raw.(map[string]any); !ok {
+			return errors.New("output_schema must be an object")
+		}
+	}
+	return validateResponseAllowedCallers(member["allowed_callers"])
+}
+
+func validateResponseNamespaceCustom(member map[string]any) (string, error) {
+	if err := validateResponseObjectKeys(member, "type", "name", "description", "format", "defer_loading", "allowed_callers"); err != nil {
+		return "", err
+	}
+	if raw, exists := member["defer_loading"]; exists {
+		if _, ok := raw.(bool); !ok {
+			return "", errors.New("defer_loading must be a boolean")
+		}
+	}
+	formatDescription, err := validateResponseCustomFormat(member["format"])
+	if err != nil {
+		return "", fmt.Errorf("format %v", err)
+	}
+	if err := validateResponseAllowedCallers(member["allowed_callers"]); err != nil {
+		return "", err
+	}
+	return formatDescription, nil
+}
+
+func validateResponseAllowedCallers(raw any) error {
+	if raw == nil {
+		return nil
+	}
+	callers, ok := raw.([]any)
+	if !ok || len(callers) == 0 {
+		return errors.New("allowed_callers must be a non-empty array")
+	}
+	for _, rawCaller := range callers {
+		caller, ok := rawCaller.(string)
+		if !ok || (caller != "direct" && caller != "programmatic") {
+			return errors.New("allowed_callers entries must be direct or programmatic")
+		}
+	}
+	return nil
 }
 
 func normalizeResponseToolChoice(raw any, registry responseToolRegistry) (any, any, error) {
@@ -832,7 +1005,7 @@ func normalizeResponseToolChoice(raw any, registry responseToolRegistry) (any, a
 		} else if err := validateResponseObjectKeys(value, "type"); err != nil {
 			return nil, nil, responseToolChoiceError(fmt.Sprintf("tool_choice %v", err))
 		}
-		definition, exists := registry.byTypeName[responseToolKey(toolType, name)]
+		definition, exists := registry.byTypeName[responseToolKey(toolType, "", name)]
 		if !exists {
 			return nil, nil, responseToolChoiceError(fmt.Sprintf("tool_choice does not reference a provided %s tool", toolType))
 		}
@@ -849,12 +1022,12 @@ func normalizeResponseToolChoice(raw any, registry responseToolRegistry) (any, a
 	}
 }
 
-func (registry responseToolRegistry) internalName(toolType, name string) string {
-	return registry.byTypeName[responseToolKey(toolType, name)].InternalName
+func (registry responseToolRegistry) internalName(toolType, namespace, name string) string {
+	return registry.byTypeName[responseToolKey(toolType, namespace, name)].InternalName
 }
 
-func responseToolKey(toolType, name string) string {
-	return toolType + "\x00" + name
+func responseToolKey(toolType, namespace, name string) string {
+	return toolType + "\x00" + namespace + "\x00" + name
 }
 
 func nextResponseInternalName(toolType string, index int, used map[string]struct{}) string {
@@ -953,7 +1126,7 @@ func responseApplyPatchParameters() map[string]any {
 
 func isHostedResponseTool(toolType string) bool {
 	switch toolType {
-	case "file_search", "code_interpreter", "image_generation", "mcp", "tool_search", "namespace", "programmatic_tool_calling":
+	case "file_search", "code_interpreter", "image_generation", "mcp", "tool_search", "programmatic_tool_calling":
 		return true
 	}
 	return strings.HasPrefix(toolType, "web_search") || strings.HasPrefix(toolType, "computer")
@@ -1104,6 +1277,9 @@ func responseNativeToolOutput(definition responseToolDefinition, callID, argumen
 	case responseToolFunction:
 		base["type"] = "function_call"
 		base["name"] = definition.Name
+		if definition.Namespace != "" {
+			base["namespace"] = definition.Namespace
+		}
 		base["arguments"] = arguments
 	case responseToolCustom:
 		if err := validateResponseObjectKeys(decoded, "input"); err != nil {
@@ -1115,6 +1291,9 @@ func responseNativeToolOutput(definition responseToolDefinition, callID, argumen
 		}
 		base["type"] = "custom_tool_call"
 		base["name"] = definition.Name
+		if definition.Namespace != "" {
+			base["namespace"] = definition.Namespace
+		}
 		base["input"] = input
 	case responseToolLocalShell:
 		if err := validateResponseObjectKeys(decoded, "command", "timeout_ms", "working_directory", "env", "user"); err != nil {

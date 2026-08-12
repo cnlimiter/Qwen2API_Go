@@ -134,8 +134,8 @@ func (h *Handler) prepareChatRequest(ctx context.Context, payload executedChatRe
 	fullUpstreamMessages := normalizeMessages(cloneMessageList(expandedMessages), chatType, thinkingMode)
 
 	lastUpstreamMessages := fullUpstreamMessages
-	if len(payload.Messages) > 0 && len(expandedMessages) > 1 {
-		lastRaw := selectIncrementalTailMessages(payload.Messages)
+	if len(expandedMessages) > 1 {
+		lastRaw := selectIncrementalTailMessages(expandedMessages)
 		lastExpanded := toolcall.NormalizeToolMessagesForExecution(lastRaw)
 		lastUpstreamMessages = normalizeMessages(lastExpanded, chatType, thinkingMode)
 	}
