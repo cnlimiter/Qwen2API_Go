@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.2](https://github.com/cnlimiter/Qwen2API_Go/compare/v1.2.1...v1.2.2) (2026-08-12)
+
+
+### Bug Fixes
+
+* support Responses namespace tools ([7c27b5e](https://github.com/cnlimiter/Qwen2API_Go/commit/7c27b5eb00930196c23d866c18cec153a381324e))
+
 ## [1.2.1](https://github.com/cnlimiter/Qwen2API_Go/compare/v1.2.0...v1.2.1) (2026-08-12)
 
 
