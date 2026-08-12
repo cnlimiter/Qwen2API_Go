@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -14,32 +15,44 @@ import (
 )
 
 type responsesRequest struct {
-	Model             string                 `json:"model"`
-	Input             json.RawMessage        `json:"input"`
-	Instructions      *string                `json:"instructions"`
-	Stream            bool                   `json:"stream"`
-	Tools             []responseFunctionTool `json:"tools"`
-	ToolChoice        any                    `json:"tool_choice"`
-	ParallelToolCalls *bool                  `json:"parallel_tool_calls"`
-	Metadata          map[string]any         `json:"metadata"`
-	Reasoning         *chatReasoning         `json:"reasoning"`
+	Model             string            `json:"model"`
+	Input             json.RawMessage   `json:"input"`
+	Instructions      *string           `json:"instructions"`
+	Stream            bool              `json:"stream"`
+	Tools             []json.RawMessage `json:"tools"`
+	ToolChoice        any               `json:"tool_choice"`
+	ParallelToolCalls *bool             `json:"parallel_tool_calls"`
+	Metadata          map[string]any    `json:"metadata"`
+	Reasoning         *chatReasoning    `json:"reasoning"`
 }
 
-type responseFunctionTool struct {
-	Type        string         `json:"type"`
-	Name        string         `json:"name"`
-	Description string         `json:"description,omitempty"`
-	Parameters  map[string]any `json:"parameters"`
-	Strict      *bool          `json:"strict,omitempty"`
+const (
+	responseToolFunction   = "function"
+	responseToolCustom     = "custom"
+	responseToolLocalShell = "local_shell"
+	responseToolShell      = "shell"
+	responseToolApplyPatch = "apply_patch"
+)
+
+type responseToolDefinition struct {
+	Type         string
+	Name         string
+	InternalName string
+}
+
+type responseToolRegistry struct {
+	definitions []responseToolDefinition
+	byTypeName  map[string]responseToolDefinition
 }
 
 type normalizedResponsesRequest struct {
-	Messages       []map[string]any
-	ChatTools      []any
-	ChatToolChoice any
-	ResponseTools  []map[string]any
-	ToolChoice     any
-	Parallel       bool
+	Messages        []map[string]any
+	ChatTools       []any
+	ChatToolChoice  any
+	ResponseTools   []map[string]any
+	ToolDefinitions []responseToolDefinition
+	ToolChoice      any
+	Parallel        bool
 }
 
 type responseContext struct {
@@ -51,6 +64,7 @@ type responseContext struct {
 	ParallelToolCalls bool
 	ToolChoice        any
 	Tools             []map[string]any
+	ToolDefinitions   []responseToolDefinition
 }
 
 type responseOutputBuilder struct {
@@ -162,7 +176,11 @@ func normalizeResponsesRequest(payload responsesRequest) (normalizedResponsesReq
 	if strings.TrimSpace(payload.Model) == "" {
 		return normalizedResponsesRequest{}, &responseRequestError{param: "model", message: "model is required"}
 	}
-	messages, err := normalizeResponseInput(payload.Input)
+	chatTools, responseTools, registry, err := normalizeResponseTools(payload.Tools)
+	if err != nil {
+		return normalizedResponsesRequest{}, err
+	}
+	messages, err := normalizeResponseInputWithTools(payload.Input, registry)
 	if err != nil {
 		return normalizedResponsesRequest{}, err
 	}
@@ -170,11 +188,7 @@ func normalizeResponsesRequest(payload responsesRequest) (normalizedResponsesReq
 		messages = append([]map[string]any{{"role": "system", "content": *payload.Instructions}}, messages...)
 	}
 
-	chatTools, responseTools, toolNames, err := normalizeResponseTools(payload.Tools)
-	if err != nil {
-		return normalizedResponsesRequest{}, err
-	}
-	chatToolChoice, responseToolChoice, err := normalizeResponseToolChoice(payload.ToolChoice, toolNames)
+	chatToolChoice, responseToolChoice, err := normalizeResponseToolChoice(payload.ToolChoice, registry)
 	if err != nil {
 		return normalizedResponsesRequest{}, err
 	}
@@ -184,16 +198,21 @@ func normalizeResponsesRequest(payload responsesRequest) (normalizedResponsesReq
 		parallel = *payload.ParallelToolCalls
 	}
 	return normalizedResponsesRequest{
-		Messages:       messages,
-		ChatTools:      chatTools,
-		ChatToolChoice: chatToolChoice,
-		ResponseTools:  responseTools,
-		ToolChoice:     responseToolChoice,
-		Parallel:       parallel,
+		Messages:        messages,
+		ChatTools:       chatTools,
+		ChatToolChoice:  chatToolChoice,
+		ResponseTools:   responseTools,
+		ToolDefinitions: registry.definitions,
+		ToolChoice:      responseToolChoice,
+		Parallel:        parallel,
 	}, nil
 }
 
 func normalizeResponseInput(raw json.RawMessage) ([]map[string]any, error) {
+	return normalizeResponseInputWithTools(raw, responseToolRegistry{})
+}
+
+func normalizeResponseInputWithTools(raw json.RawMessage, registry responseToolRegistry) ([]map[string]any, error) {
 	trimmed := strings.TrimSpace(string(raw))
 	if trimmed == "" || trimmed == "null" {
 		return nil, responseInputError("input is required")
@@ -215,7 +234,8 @@ func normalizeResponseInput(raw json.RawMessage) ([]map[string]any, error) {
 	}
 
 	messages := make([]map[string]any, 0, len(items))
-	functionNames := make(map[string]string)
+	calls := make(map[string]responseInputToolCall)
+	outputs := make(map[string]struct{})
 	for index, item := range items {
 		itemType := strings.ToLower(strings.TrimSpace(stringValue(item["type"])))
 		switch itemType {
@@ -227,41 +247,52 @@ func normalizeResponseInput(raw json.RawMessage) ([]map[string]any, error) {
 			if callID == "" || name == "" || !ok || json.Unmarshal([]byte(arguments), &decodedArguments) != nil {
 				return nil, responseInputError(fmt.Sprintf("input[%d] has an invalid function_call", index))
 			}
-			if _, exists := functionNames[callID]; exists {
+			if _, exists := calls[callID]; exists {
 				return nil, responseInputError(fmt.Sprintf("input[%d].call_id is duplicated", index))
 			}
-			functionNames[callID] = name
-			messages = append(messages, map[string]any{
-				"role":    "assistant",
-				"content": nil,
-				"tool_calls": []any{map[string]any{
-					"id":   callID,
-					"type": "function",
-					"function": map[string]any{
-						"name":      name,
-						"arguments": arguments,
-					},
-				}},
-			})
-		case "function_call_output":
-			callID := strings.TrimSpace(stringValue(item["call_id"]))
-			if callID == "" {
-				return nil, responseInputError(fmt.Sprintf("input[%d].call_id is required", index))
+			calls[callID] = responseInputToolCall{Type: responseToolFunction, InternalName: name}
+			messages = append(messages, responseAssistantToolMessage(callID, name, arguments))
+		case "custom_tool_call":
+			callID, callIDErr := requiredResponseString(item["call_id"], "call_id")
+			name, nameErr := requiredResponseString(item["name"], "name")
+			input, ok := item["input"].(string)
+			if callIDErr != nil || nameErr != nil || !ok {
+				return nil, responseInputError(fmt.Sprintf("input[%d] has an invalid custom_tool_call", index))
 			}
-			name, exists := functionNames[callID]
-			if !exists {
-				return nil, responseInputError(fmt.Sprintf("input[%d].call_id does not match a previous function_call", index))
+			if _, exists := calls[callID]; exists {
+				return nil, responseInputError(fmt.Sprintf("input[%d].call_id is duplicated", index))
 			}
-			output, err := normalizeResponseTextContent(item["output"])
+			internalName := registry.internalName(responseToolCustom, name)
+			if internalName == "" {
+				return nil, responseInputError(fmt.Sprintf("input[%d].name does not reference a provided custom tool", index))
+			}
+			calls[callID] = responseInputToolCall{Type: responseToolCustom, InternalName: internalName}
+			arguments, err := json.Marshal(map[string]any{"input": input})
 			if err != nil {
-				return nil, responseInputError(fmt.Sprintf("input[%d].output must contain text", index))
+				return nil, responseInputError(fmt.Sprintf("input[%d] has an invalid custom_tool_call", index))
 			}
-			messages = append(messages, map[string]any{
-				"role":         "tool",
-				"tool_call_id": callID,
-				"name":         name,
-				"content":      output,
-			})
+			messages = append(messages, responseAssistantToolMessage(callID, internalName, string(arguments)))
+		case "local_shell_call", "shell_call", "apply_patch_call":
+			toolType := strings.TrimSuffix(itemType, "_call")
+			call, arguments, err := normalizeResponseNativeInputCall(index, item, toolType, registry)
+			if err != nil {
+				return nil, err
+			}
+			if _, exists := calls[call.CallID]; exists {
+				return nil, responseInputError(fmt.Sprintf("input[%d].call_id is duplicated", index))
+			}
+			calls[call.CallID] = call.responseInputToolCall
+			messages = append(messages, responseAssistantToolMessage(call.CallID, call.InternalName, arguments))
+		case "function_call_output", "custom_tool_call_output", "local_shell_call_output", "shell_call_output", "apply_patch_call_output":
+			toolType := strings.TrimSuffix(itemType, "_call_output")
+			if toolType == "custom_tool" {
+				toolType = responseToolCustom
+			}
+			message, err := normalizeResponseToolOutput(index, item, toolType, calls, outputs)
+			if err != nil {
+				return nil, err
+			}
+			messages = append(messages, message)
 		case "", "message":
 			role := strings.ToLower(strings.TrimSpace(stringValue(item["role"])))
 			switch role {
@@ -282,6 +313,332 @@ func normalizeResponseInput(raw json.RawMessage) ([]map[string]any, error) {
 		}
 	}
 	return messages, nil
+}
+
+type responseInputToolCall struct {
+	Type         string
+	InternalName string
+}
+
+type responseNativeInputCall struct {
+	responseInputToolCall
+	CallID string
+}
+
+func responseAssistantToolMessage(callID, name, arguments string) map[string]any {
+	return map[string]any{
+		"role":    "assistant",
+		"content": nil,
+		"tool_calls": []any{map[string]any{
+			"id":   callID,
+			"type": "function",
+			"function": map[string]any{
+				"name":      name,
+				"arguments": arguments,
+			},
+		}},
+	}
+}
+
+func normalizeResponseNativeInputCall(index int, item map[string]any, toolType string, registry responseToolRegistry) (responseNativeInputCall, string, error) {
+	callID, err := requiredResponseString(item["call_id"], "call_id")
+	if err != nil {
+		return responseNativeInputCall{}, "", responseInputError(fmt.Sprintf("input[%d].call_id is required", index))
+	}
+	internalName := registry.internalName(toolType, toolType)
+	if internalName == "" {
+		return responseNativeInputCall{}, "", responseInputError(fmt.Sprintf("input[%d] references a %s tool that was not provided", index, toolType))
+	}
+
+	var arguments map[string]any
+	switch toolType {
+	case responseToolLocalShell:
+		arguments, err = normalizeResponseLocalShellAction(item["action"])
+	case responseToolShell:
+		arguments, err = normalizeResponseShellAction(item["action"])
+	case responseToolApplyPatch:
+		arguments, err = normalizeResponseApplyPatchOperation(item["operation"])
+	default:
+		err = fmt.Errorf("unsupported native tool type %q", toolType)
+	}
+	if err != nil {
+		return responseNativeInputCall{}, "", responseInputError(fmt.Sprintf("input[%d] has an invalid %s_call: %v", index, toolType, err))
+	}
+	rawArguments, err := json.Marshal(arguments)
+	if err != nil {
+		return responseNativeInputCall{}, "", responseInputError(fmt.Sprintf("input[%d] has an invalid %s_call", index, toolType))
+	}
+	return responseNativeInputCall{
+		responseInputToolCall: responseInputToolCall{Type: toolType, InternalName: internalName},
+		CallID:                callID,
+	}, string(rawArguments), nil
+}
+
+func normalizeResponseToolOutput(index int, item map[string]any, expectedType string, calls map[string]responseInputToolCall, outputs map[string]struct{}) (map[string]any, error) {
+	callID, err := requiredResponseString(item["call_id"], "call_id")
+	if err != nil {
+		return nil, responseInputError(fmt.Sprintf("input[%d].call_id is required", index))
+	}
+	call, exists := calls[callID]
+	if !exists {
+		return nil, responseInputError(fmt.Sprintf("input[%d].call_id does not match a previous %s_call", index, expectedType))
+	}
+	if call.Type != expectedType {
+		return nil, responseInputError(fmt.Sprintf("input[%d].call_id references %s_call, not %s_call", index, call.Type, expectedType))
+	}
+	if _, exists := outputs[callID]; exists {
+		return nil, responseInputError(fmt.Sprintf("input[%d].call_id output is duplicated", index))
+	}
+
+	var content any
+	switch expectedType {
+	case responseToolFunction, responseToolCustom:
+		content, err = normalizeResponseTextContent(item["output"])
+	case responseToolLocalShell:
+		content, err = requiredResponseString(item["output"], "output")
+	case responseToolShell:
+		content, err = normalizeResponseShellOutput(item["output"])
+	case responseToolApplyPatch:
+		content, err = normalizeResponseApplyPatchOutput(item)
+	}
+	if err != nil {
+		return nil, responseInputError(fmt.Sprintf("input[%d] has an invalid %s_call_output: %v", index, expectedType, err))
+	}
+	outputs[callID] = struct{}{}
+	return map[string]any{
+		"role":         "tool",
+		"tool_call_id": callID,
+		"name":         call.InternalName,
+		"content":      content,
+	}, nil
+}
+
+func normalizeResponseLocalShellAction(raw any) (map[string]any, error) {
+	action, ok := raw.(map[string]any)
+	if !ok {
+		return nil, errors.New("action must be an object")
+	}
+	if strings.TrimSpace(stringValue(action["type"])) != "exec" {
+		return nil, errors.New("action.type must be exec")
+	}
+	if err := validateResponseObjectKeys(action, "type", "command", "timeout_ms", "working_directory", "env", "user"); err != nil {
+		return nil, err
+	}
+	command, err := responseStringArray(action["command"], "action.command")
+	if err != nil {
+		return nil, err
+	}
+	result := map[string]any{"command": command}
+	if value, exists := action["timeout_ms"]; exists {
+		result["timeout_ms"], err = responsePositiveInteger(value, "action.timeout_ms")
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, field := range []string{"working_directory", "user"} {
+		if value, exists := action[field]; exists {
+			result[field], err = requiredResponseString(value, "action."+field)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	if value, exists := action["env"]; exists {
+		env, ok := value.(map[string]any)
+		if !ok {
+			return nil, errors.New("action.env must be an object of strings")
+		}
+		normalized := make(map[string]any, len(env))
+		for key, rawValue := range env {
+			stringValue, ok := rawValue.(string)
+			if strings.TrimSpace(key) == "" || !ok {
+				return nil, errors.New("action.env must be an object of strings")
+			}
+			normalized[key] = stringValue
+		}
+		result["env"] = normalized
+	}
+	return result, nil
+}
+
+func normalizeResponseShellAction(raw any) (map[string]any, error) {
+	action, ok := raw.(map[string]any)
+	if !ok {
+		return nil, errors.New("action must be an object")
+	}
+	if err := validateResponseObjectKeys(action, "commands", "timeout_ms", "max_output_length"); err != nil {
+		return nil, err
+	}
+	commands, err := responseStringArray(action["commands"], "action.commands")
+	if err != nil {
+		return nil, err
+	}
+	result := map[string]any{"commands": commands}
+	for _, field := range []string{"timeout_ms", "max_output_length"} {
+		if value, exists := action[field]; exists {
+			result[field], err = responsePositiveInteger(value, "action."+field)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	return result, nil
+}
+
+func normalizeResponseApplyPatchOperation(raw any) (map[string]any, error) {
+	operation, ok := raw.(map[string]any)
+	if !ok {
+		return nil, errors.New("operation must be an object")
+	}
+	if err := validateResponseObjectKeys(operation, "type", "path", "diff"); err != nil {
+		return nil, err
+	}
+	operationType := strings.TrimSpace(stringValue(operation["type"]))
+	if operationType != "create_file" && operationType != "update_file" && operationType != "delete_file" {
+		return nil, errors.New("operation.type must be create_file, update_file, or delete_file")
+	}
+	path, err := requiredResponseString(operation["path"], "operation.path")
+	if err != nil {
+		return nil, err
+	}
+	result := map[string]any{"operation": operationType, "path": path}
+	if operationType != "delete_file" {
+		diff, err := requiredResponseString(operation["diff"], "operation.diff")
+		if err != nil {
+			return nil, err
+		}
+		result["diff"] = diff
+	} else if _, exists := operation["diff"]; exists {
+		return nil, errors.New("operation.diff is not valid for delete_file")
+	}
+	return result, nil
+}
+
+func normalizeResponseShellOutput(raw any) (string, error) {
+	items, ok := raw.([]any)
+	if !ok {
+		return "", errors.New("output must be an array")
+	}
+	for index, rawItem := range items {
+		item, ok := rawItem.(map[string]any)
+		if !ok {
+			return "", fmt.Errorf("output[%d] must be an object", index)
+		}
+		if err := validateResponseObjectKeys(item, "stdout", "stderr", "outcome"); err != nil {
+			return "", fmt.Errorf("output[%d]: %w", index, err)
+		}
+		if _, err := requiredResponseStringAllowEmpty(item["stdout"], "stdout"); err != nil {
+			return "", fmt.Errorf("output[%d]: %w", index, err)
+		}
+		if _, err := requiredResponseStringAllowEmpty(item["stderr"], "stderr"); err != nil {
+			return "", fmt.Errorf("output[%d]: %w", index, err)
+		}
+		outcome, ok := item["outcome"].(map[string]any)
+		if !ok {
+			return "", fmt.Errorf("output[%d].outcome must be an object", index)
+		}
+		switch strings.TrimSpace(stringValue(outcome["type"])) {
+		case "timeout":
+			if err := validateResponseObjectKeys(outcome, "type"); err != nil {
+				return "", fmt.Errorf("output[%d].outcome: %w", index, err)
+			}
+		case "exit":
+			if err := validateResponseObjectKeys(outcome, "type", "exit_code"); err != nil {
+				return "", fmt.Errorf("output[%d].outcome: %w", index, err)
+			}
+			if _, err := responseInteger(outcome["exit_code"], "exit_code"); err != nil {
+				return "", fmt.Errorf("output[%d].outcome: %w", index, err)
+			}
+		default:
+			return "", fmt.Errorf("output[%d].outcome.type must be exit or timeout", index)
+		}
+	}
+	encoded, err := json.Marshal(items)
+	if err != nil {
+		return "", errors.New("output is not JSON serializable")
+	}
+	return string(encoded), nil
+}
+
+func normalizeResponseApplyPatchOutput(item map[string]any) (string, error) {
+	status := strings.TrimSpace(stringValue(item["status"]))
+	if status != "completed" && status != "failed" {
+		return "", errors.New("status must be completed or failed")
+	}
+	output := ""
+	if value, exists := item["output"]; exists {
+		var err error
+		output, err = requiredResponseStringAllowEmpty(value, "output")
+		if err != nil {
+			return "", err
+		}
+	}
+	encoded, err := json.Marshal(map[string]any{"status": status, "output": output})
+	if err != nil {
+		return "", errors.New("output is not JSON serializable")
+	}
+	return string(encoded), nil
+}
+
+func responseStringArray(raw any, field string) ([]any, error) {
+	items, ok := raw.([]any)
+	if !ok || len(items) == 0 {
+		return nil, fmt.Errorf("%s must be a non-empty array of strings", field)
+	}
+	result := make([]any, len(items))
+	for index, rawItem := range items {
+		item, ok := rawItem.(string)
+		if !ok || strings.TrimSpace(item) == "" {
+			return nil, fmt.Errorf("%s[%d] must be a non-empty string", field, index)
+		}
+		result[index] = item
+	}
+	return result, nil
+}
+
+func responseInteger(raw any, field string) (int, error) {
+	value, ok := raw.(float64)
+	if !ok || math.Trunc(value) != value || value < math.MinInt32 || value > math.MaxInt32 {
+		return 0, fmt.Errorf("%s must be an integer", field)
+	}
+	return int(value), nil
+}
+
+func responsePositiveInteger(raw any, field string) (int, error) {
+	value, err := responseInteger(raw, field)
+	if err != nil || value <= 0 {
+		return 0, fmt.Errorf("%s must be a positive integer", field)
+	}
+	return value, nil
+}
+
+func requiredResponseString(raw any, field string) (string, error) {
+	value, err := requiredResponseStringAllowEmpty(raw, field)
+	if err != nil || strings.TrimSpace(value) == "" {
+		return "", fmt.Errorf("%s must be a non-empty string", field)
+	}
+	return value, nil
+}
+
+func requiredResponseStringAllowEmpty(raw any, field string) (string, error) {
+	value, ok := raw.(string)
+	if !ok {
+		return "", fmt.Errorf("%s must be a string", field)
+	}
+	return value, nil
+}
+
+func validateResponseObjectKeys(object map[string]any, allowed ...string) error {
+	allowedKeys := make(map[string]struct{}, len(allowed))
+	for _, key := range allowed {
+		allowedKeys[key] = struct{}{}
+	}
+	for key := range object {
+		if _, ok := allowedKeys[key]; !ok {
+			return fmt.Errorf("field %q is not supported", key)
+		}
+	}
+	return nil
 }
 
 func normalizeResponseTextContent(raw any) (any, error) {
@@ -316,43 +673,126 @@ func normalizeResponseTextContent(raw any) (any, error) {
 	}
 }
 
-func normalizeResponseTools(tools []responseFunctionTool) ([]any, []map[string]any, []string, error) {
-	chatTools := make([]any, 0, len(tools))
-	responseTools := make([]map[string]any, 0, len(tools))
-	toolNames := make([]string, 0, len(tools))
-	for index, tool := range tools {
-		if !strings.EqualFold(strings.TrimSpace(tool.Type), "function") {
-			return nil, nil, nil, responseToolError(fmt.Sprintf("tools[%d].type must be function", index))
-		}
-		name := strings.TrimSpace(tool.Name)
-		if name == "" {
-			return nil, nil, nil, responseToolError(fmt.Sprintf("tools[%d].name is required", index))
-		}
-		if tool.Parameters == nil {
-			return nil, nil, nil, responseToolError(fmt.Sprintf("tools[%d].parameters is required", index))
-		}
-		function := map[string]any{
-			"name":        name,
-			"description": tool.Description,
-			"parameters":  tool.Parameters,
-		}
-		chatTools = append(chatTools, map[string]any{"type": "function", "function": function})
-		echo := map[string]any{
-			"type":        "function",
-			"name":        name,
-			"description": tool.Description,
-			"parameters":  tool.Parameters,
-		}
-		if tool.Strict != nil {
-			echo["strict"] = *tool.Strict
-		}
-		responseTools = append(responseTools, echo)
-		toolNames = append(toolNames, name)
+func normalizeResponseTools(tools []json.RawMessage) ([]any, []map[string]any, responseToolRegistry, error) {
+	registry := responseToolRegistry{
+		byTypeName: make(map[string]responseToolDefinition),
 	}
-	return chatTools, responseTools, toolNames, nil
+	parsed := make([]map[string]any, len(tools))
+	usedInternalNames := make(map[string]struct{}, len(tools))
+	for index, raw := range tools {
+		var tool map[string]any
+		if err := json.Unmarshal(raw, &tool); err != nil || tool == nil {
+			return nil, nil, responseToolRegistry{}, responseToolError(fmt.Sprintf("tools[%d] must be an object", index))
+		}
+		parsed[index] = tool
+		rawType, _ := tool["type"].(string)
+		if strings.ToLower(strings.TrimSpace(rawType)) == responseToolFunction {
+			name, _ := tool["name"].(string)
+			name = strings.TrimSpace(name)
+			if name != "" {
+				usedInternalNames[name] = struct{}{}
+			}
+		}
+	}
+
+	chatTools := make([]any, 0, len(parsed))
+	responseTools := make([]map[string]any, 0, len(parsed))
+	for index, tool := range parsed {
+		rawType, ok := tool["type"].(string)
+		toolType := strings.ToLower(strings.TrimSpace(rawType))
+		if !ok || toolType == "" {
+			return nil, nil, responseToolRegistry{}, responseToolError(fmt.Sprintf("tools[%d].type must be a non-empty string", index))
+		}
+		if isHostedResponseTool(toolType) {
+			return nil, nil, responseToolRegistry{}, responseToolError(fmt.Sprintf("tools[%d].type %q requires OpenAI-hosted execution, which this backend cannot provide", index, toolType))
+		}
+
+		name := toolType
+		internalName := ""
+		var description string
+		var parameters map[string]any
+		var err error
+		switch toolType {
+		case responseToolFunction:
+			name, err = requiredResponseString(tool["name"], "name")
+			if err != nil {
+				return nil, nil, responseToolRegistry{}, responseToolError(fmt.Sprintf("tools[%d].name must be a non-empty string", index))
+			}
+			parameters, _ = tool["parameters"].(map[string]any)
+			if parameters == nil {
+				return nil, nil, responseToolRegistry{}, responseToolError(fmt.Sprintf("tools[%d].parameters is required", index))
+			}
+			if rawDescription, exists := tool["description"]; exists {
+				description, ok = rawDescription.(string)
+				if !ok {
+					return nil, nil, responseToolRegistry{}, responseToolError(fmt.Sprintf("tools[%d].description must be a string", index))
+				}
+			}
+			if rawStrict, exists := tool["strict"]; exists {
+				if _, ok := rawStrict.(bool); !ok {
+					return nil, nil, responseToolRegistry{}, responseToolError(fmt.Sprintf("tools[%d].strict must be a boolean", index))
+				}
+			}
+			internalName = name
+		case responseToolCustom:
+			name, err = requiredResponseString(tool["name"], "name")
+			if err != nil {
+				return nil, nil, responseToolRegistry{}, responseToolError(fmt.Sprintf("tools[%d].name must be a non-empty string", index))
+			}
+			if rawDescription, exists := tool["description"]; exists {
+				description, ok = rawDescription.(string)
+				if !ok {
+					return nil, nil, responseToolRegistry{}, responseToolError(fmt.Sprintf("tools[%d].description must be a string", index))
+				}
+			}
+			formatDescription, err := validateResponseCustomFormat(tool["format"])
+			if err != nil {
+				return nil, nil, responseToolRegistry{}, responseToolError(fmt.Sprintf("tools[%d].format %v", index, err))
+			}
+			description = strings.TrimSpace(strings.Join([]string{description, formatDescription}, "\n"))
+			parameters = responseCustomParameters()
+			internalName = nextResponseInternalName(toolType, index, usedInternalNames)
+		case responseToolLocalShell:
+			description = "Execute a local command. Supply command as a JSON array of executable and arguments; optional timeout_ms, working_directory, env, and user must use their documented types."
+			parameters = responseLocalShellParameters()
+			internalName = nextResponseInternalName(toolType, index, usedInternalNames)
+		case responseToolShell:
+			description = "Execute ordered shell commands. Supply commands as a JSON array of strings and optional positive timeout_ms and max_output_length integers."
+			parameters = responseShellParameters()
+			internalName = nextResponseInternalName(toolType, index, usedInternalNames)
+		case responseToolApplyPatch:
+			description = "Apply one file patch operation. Supply operation as create_file, update_file, or delete_file; path is required, and diff is required except for delete_file."
+			parameters = responseApplyPatchParameters()
+			internalName = nextResponseInternalName(toolType, index, usedInternalNames)
+		default:
+			return nil, nil, responseToolRegistry{}, responseToolError(fmt.Sprintf("tools[%d].type %q is not supported", index, toolType))
+		}
+
+		key := responseToolKey(toolType, name)
+		if _, exists := registry.byTypeName[key]; exists {
+			return nil, nil, responseToolRegistry{}, responseToolError(fmt.Sprintf("tools[%d] duplicates %s tool %q", index, toolType, name))
+		}
+		definition := responseToolDefinition{Type: toolType, Name: name, InternalName: internalName}
+		registry.definitions = append(registry.definitions, definition)
+		registry.byTypeName[key] = definition
+		usedInternalNames[internalName] = struct{}{}
+
+		chatTools = append(chatTools, map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        internalName,
+				"description": description,
+				"parameters":  parameters,
+			},
+		})
+		echo := cloneMap(tool)
+		echo["type"] = toolType
+		responseTools = append(responseTools, echo)
+	}
+	return chatTools, responseTools, registry, nil
 }
 
-func normalizeResponseToolChoice(raw any, toolNames []string) (any, any, error) {
+func normalizeResponseToolChoice(raw any, registry responseToolRegistry) (any, any, error) {
 	if raw == nil {
 		return "auto", "auto", nil
 	}
@@ -363,37 +803,160 @@ func normalizeResponseToolChoice(raw any, toolNames []string) (any, any, error) 
 		case "none", "auto":
 			return choice, choice, nil
 		case "required":
-			if len(toolNames) == 0 {
-				return nil, nil, responseToolChoiceError("tool_choice required needs at least one function tool")
+			if len(registry.definitions) == 0 {
+				return nil, nil, responseToolChoiceError("tool_choice required needs at least one tool")
 			}
 			return choice, choice, nil
 		default:
-			return nil, nil, responseToolChoiceError("tool_choice must be none, auto, required, or a named function")
+			return nil, nil, responseToolChoiceError("tool_choice must be none, auto, required, or a supported tool selector")
 		}
 	case map[string]any:
-		if !strings.EqualFold(strings.TrimSpace(stringValue(value["type"])), "function") {
-			return nil, nil, responseToolChoiceError("tool_choice.type must be function")
+		rawType, ok := value["type"].(string)
+		toolType := strings.ToLower(strings.TrimSpace(rawType))
+		if !ok || toolType == "" {
+			return nil, nil, responseToolChoiceError("tool_choice.type must be a non-empty string")
 		}
-		name := strings.TrimSpace(stringValue(value["name"]))
-		if name == "" || !containsString(toolNames, name) {
-			return nil, nil, responseToolChoiceError("tool_choice.name must reference a provided function tool")
+		if isHostedResponseTool(toolType) {
+			return nil, nil, responseToolChoiceError(fmt.Sprintf("tool_choice.type %q requires OpenAI-hosted execution, which this backend cannot provide", toolType))
+		}
+		name := toolType
+		if toolType == responseToolFunction || toolType == responseToolCustom {
+			if err := validateResponseObjectKeys(value, "type", "name"); err != nil {
+				return nil, nil, responseToolChoiceError(fmt.Sprintf("tool_choice %v", err))
+			}
+			var err error
+			name, err = requiredResponseString(value["name"], "name")
+			if err != nil {
+				return nil, nil, responseToolChoiceError("tool_choice.name is required for function and custom tools")
+			}
+		} else if err := validateResponseObjectKeys(value, "type"); err != nil {
+			return nil, nil, responseToolChoiceError(fmt.Sprintf("tool_choice %v", err))
+		}
+		definition, exists := registry.byTypeName[responseToolKey(toolType, name)]
+		if !exists {
+			return nil, nil, responseToolChoiceError(fmt.Sprintf("tool_choice does not reference a provided %s tool", toolType))
+		}
+		responseChoice := map[string]any{"type": toolType}
+		if toolType == responseToolFunction || toolType == responseToolCustom {
+			responseChoice["name"] = name
 		}
 		return map[string]any{
 			"type":     "function",
-			"function": map[string]any{"name": name},
-		}, map[string]any{"type": "function", "name": name}, nil
+			"function": map[string]any{"name": definition.InternalName},
+		}, responseChoice, nil
 	default:
 		return nil, nil, responseToolChoiceError("tool_choice has an invalid type")
 	}
 }
 
-func containsString(values []string, target string) bool {
-	for _, value := range values {
-		if value == target {
-			return true
+func (registry responseToolRegistry) internalName(toolType, name string) string {
+	return registry.byTypeName[responseToolKey(toolType, name)].InternalName
+}
+
+func responseToolKey(toolType, name string) string {
+	return toolType + "\x00" + name
+}
+
+func nextResponseInternalName(toolType string, index int, used map[string]struct{}) string {
+	base := fmt.Sprintf("__responses_%s_%d", toolType, index)
+	name := base
+	for suffix := 1; ; suffix++ {
+		if _, exists := used[name]; !exists {
+			return name
 		}
+		name = fmt.Sprintf("%s_%d", base, suffix)
 	}
-	return false
+}
+
+func validateResponseCustomFormat(raw any) (string, error) {
+	if raw == nil {
+		return "Input format: unconstrained text.", nil
+	}
+	format, ok := raw.(map[string]any)
+	if !ok {
+		return "", errors.New("must be an object")
+	}
+	formatType := strings.ToLower(strings.TrimSpace(stringValue(format["type"])))
+	switch formatType {
+	case "text":
+		if err := validateResponseObjectKeys(format, "type"); err != nil {
+			return "", err
+		}
+		return "Input format: unconstrained text.", nil
+	case "grammar":
+		if err := validateResponseObjectKeys(format, "type", "syntax", "definition"); err != nil {
+			return "", err
+		}
+		syntax := strings.ToLower(strings.TrimSpace(stringValue(format["syntax"])))
+		if syntax != "lark" && syntax != "regex" {
+			return "", errors.New("syntax must be lark or regex")
+		}
+		definition, err := requiredResponseString(format["definition"], "definition")
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("Input must conform to this %s grammar:\n%s", syntax, definition), nil
+	default:
+		return "", errors.New("type must be text or grammar")
+	}
+}
+
+func responseCustomParameters() map[string]any {
+	return map[string]any{
+		"type":                 "object",
+		"properties":           map[string]any{"input": map[string]any{"type": "string", "description": "Complete free-form tool input."}},
+		"required":             []any{"input"},
+		"additionalProperties": false,
+	}
+}
+
+func responseLocalShellParameters() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"command":           map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			"timeout_ms":        map[string]any{"type": "integer", "minimum": 1},
+			"working_directory": map[string]any{"type": "string"},
+			"env":               map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}},
+			"user":              map[string]any{"type": "string"},
+		},
+		"required":             []any{"command"},
+		"additionalProperties": false,
+	}
+}
+
+func responseShellParameters() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"commands":          map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			"timeout_ms":        map[string]any{"type": "integer", "minimum": 1},
+			"max_output_length": map[string]any{"type": "integer", "minimum": 1},
+		},
+		"required":             []any{"commands"},
+		"additionalProperties": false,
+	}
+}
+
+func responseApplyPatchParameters() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"operation": map[string]any{"type": "string", "enum": []any{"create_file", "update_file", "delete_file"}},
+			"path":      map[string]any{"type": "string"},
+			"diff":      map[string]any{"type": "string"},
+		},
+		"required":             []any{"operation", "path"},
+		"additionalProperties": false,
+	}
+}
+
+func isHostedResponseTool(toolType string) bool {
+	switch toolType {
+	case "file_search", "code_interpreter", "image_generation", "mcp", "tool_search", "namespace", "programmatic_tool_calling":
+		return true
+	}
+	return strings.HasPrefix(toolType, "web_search") || strings.HasPrefix(toolType, "computer")
 }
 
 func newResponseContext(payload responsesRequest, normalized normalizedResponsesRequest, model string) responseContext {
@@ -410,6 +973,7 @@ func newResponseContext(payload responsesRequest, normalized normalizedResponses
 		ParallelToolCalls: normalized.Parallel,
 		ToolChoice:        normalized.ToolChoice,
 		Tools:             normalized.ResponseTools,
+		ToolDefinitions:   normalized.ToolDefinitions,
 	}
 }
 
@@ -457,7 +1021,12 @@ func (h *Handler) handleResponseNonStream(w http.ResponseWriter, body io.Reader,
 	if result.Content != "" || len(result.ToolCalls) == 0 {
 		output = append(output, responseMessageOutput(fmt.Sprintf("msg_%d", time.Now().UnixNano()), result.Content, "completed"))
 	}
-	output = append(output, responseFunctionOutputs(result.ToolCalls, toolSchemas)...)
+	toolOutputs, err := responseToolOutputs(result.ToolCalls, toolSchemas, response.ToolDefinitions)
+	if err != nil {
+		writeResponseError(w, http.StatusBadGateway, fmt.Sprintf("Failed to format upstream tool call: %v", err), "api_error", nil, nil)
+		return
+	}
+	output = append(output, toolOutputs...)
 	result.PromptTokens, result.CompletionTokens, result.TotalTokens = applyUsageFallback(
 		result.PromptTokens,
 		result.CompletionTokens,
@@ -486,25 +1055,101 @@ func responseMessageOutput(id, text, status string) map[string]any {
 	}
 }
 
-func responseFunctionOutputs(calls []toolcall.ToolCall, schemas []toolcall.ToolSchema) []map[string]any {
+func responseToolOutputs(calls []toolcall.ToolCall, schemas []toolcall.ToolSchema, definitions []responseToolDefinition) ([]map[string]any, error) {
+	definitionByInternal := make(map[string]responseToolDefinition, len(definitions))
+	for _, definition := range definitions {
+		definitionByInternal[definition.InternalName] = definition
+	}
 	formatted := toolcall.FormatOpenAIToolCallsWithSchemas(calls, schemas)
 	output := make([]map[string]any, 0, len(formatted))
 	for index, call := range formatted {
 		function, _ := call["function"].(map[string]any)
+		internalName := strings.TrimSpace(stringValue(function["name"]))
+		definition, exists := definitionByInternal[internalName]
+		if !exists {
+			return nil, fmt.Errorf("tool %q is not in the Responses tool registry", internalName)
+		}
 		callID := strings.TrimSpace(stringValue(call["id"]))
 		if callID == "" {
 			callID = fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), index)
 		}
-		output = append(output, map[string]any{
-			"id":        fmt.Sprintf("fc_%d_%d", time.Now().UnixNano(), index),
-			"type":      "function_call",
-			"status":    "completed",
-			"call_id":   callID,
-			"name":      stringValue(function["name"]),
-			"arguments": stringValue(function["arguments"]),
-		})
+		arguments := stringValue(function["arguments"])
+		var decoded map[string]any
+		if err := json.Unmarshal([]byte(arguments), &decoded); err != nil {
+			return nil, fmt.Errorf("tool %q arguments are invalid JSON: %w", definition.Name, err)
+		}
+		item, err := responseNativeToolOutput(definition, callID, arguments, decoded, index)
+		if err != nil {
+			return nil, err
+		}
+		output = append(output, item)
 	}
-	return output
+	return output, nil
+}
+
+func responseNativeToolOutput(definition responseToolDefinition, callID, arguments string, decoded map[string]any, index int) (map[string]any, error) {
+	idPrefix := map[string]string{
+		responseToolFunction:   "fc",
+		responseToolCustom:     "ctc",
+		responseToolLocalShell: "lsc",
+		responseToolShell:      "sc",
+		responseToolApplyPatch: "apc",
+	}[definition.Type]
+	base := map[string]any{
+		"id":      fmt.Sprintf("%s_%d_%d", idPrefix, time.Now().UnixNano(), index),
+		"status":  "completed",
+		"call_id": callID,
+	}
+	switch definition.Type {
+	case responseToolFunction:
+		base["type"] = "function_call"
+		base["name"] = definition.Name
+		base["arguments"] = arguments
+	case responseToolCustom:
+		if err := validateResponseObjectKeys(decoded, "input"); err != nil {
+			return nil, fmt.Errorf("custom tool %q: %w", definition.Name, err)
+		}
+		input, err := requiredResponseStringAllowEmpty(decoded["input"], "input")
+		if err != nil {
+			return nil, fmt.Errorf("custom tool %q: %w", definition.Name, err)
+		}
+		base["type"] = "custom_tool_call"
+		base["name"] = definition.Name
+		base["input"] = input
+	case responseToolLocalShell:
+		if err := validateResponseObjectKeys(decoded, "command", "timeout_ms", "working_directory", "env", "user"); err != nil {
+			return nil, fmt.Errorf("local_shell tool call: %w", err)
+		}
+		action := cloneMap(decoded)
+		action["type"] = "exec"
+		if _, err := normalizeResponseLocalShellAction(action); err != nil {
+			return nil, fmt.Errorf("local_shell tool call: %w", err)
+		}
+		base["type"] = "local_shell_call"
+		base["action"] = action
+	case responseToolShell:
+		if _, err := normalizeResponseShellAction(decoded); err != nil {
+			return nil, fmt.Errorf("shell tool call: %w", err)
+		}
+		base["type"] = "shell_call"
+		base["action"] = decoded
+	case responseToolApplyPatch:
+		if err := validateResponseObjectKeys(decoded, "operation", "path", "diff"); err != nil {
+			return nil, fmt.Errorf("apply_patch tool call: %w", err)
+		}
+		operation := map[string]any{"type": decoded["operation"], "path": decoded["path"]}
+		if diff, exists := decoded["diff"]; exists {
+			operation["diff"] = diff
+		}
+		if _, err := normalizeResponseApplyPatchOperation(operation); err != nil {
+			return nil, fmt.Errorf("apply_patch tool call: %w", err)
+		}
+		base["type"] = "apply_patch_call"
+		base["operation"] = operation
+	default:
+		return nil, fmt.Errorf("tool %q has unsupported Responses type %q", definition.Name, definition.Type)
+	}
+	return base, nil
 }
 
 func responseUsage(inputTokens, outputTokens, totalTokens int) map[string]any {
@@ -563,7 +1208,10 @@ func (h *Handler) handleResponseStream(w http.ResponseWriter, body io.Reader, re
 		if len(toolNames) > 0 {
 			chunk := toolcall.ProcessStreamChunk(streamState, content)
 			builder.addText(writer, toolcall.CleanVisibleChunk(chunk.Content))
-			builder.addToolCalls(writer, chunk.ToolCalls, toolSchemas)
+			if err := builder.addToolCalls(writer, chunk.ToolCalls, toolSchemas); err != nil {
+				writer.fail(response, fmt.Sprintf("Failed to format upstream tool call: %v", err))
+				return
+			}
 			continue
 		}
 		builder.addText(writer, content)
@@ -576,7 +1224,10 @@ func (h *Handler) handleResponseStream(w http.ResponseWriter, body io.Reader, re
 	if len(toolNames) > 0 {
 		final := toolcall.FinalizeStream(streamState)
 		builder.addText(writer, toolcall.CleanVisibleChunk(final.Content))
-		builder.addToolCalls(writer, final.ToolCalls, toolSchemas)
+		if err := builder.addToolCalls(writer, final.ToolCalls, toolSchemas); err != nil {
+			writer.fail(response, fmt.Sprintf("Failed to format upstream tool call: %v", err))
+			return
+		}
 	}
 	if !builder.messageStarted && len(builder.output) == 0 {
 		builder.startMessage(writer)
@@ -673,33 +1324,53 @@ func (builder *responseOutputBuilder) finishMessage(writer *responseStreamWriter
 	builder.output[builder.messageIndex] = message
 }
 
-func (builder *responseOutputBuilder) addToolCalls(writer *responseStreamWriter, calls []toolcall.ToolCall, schemas []toolcall.ToolSchema) {
+func (builder *responseOutputBuilder) addToolCalls(writer *responseStreamWriter, calls []toolcall.ToolCall, schemas []toolcall.ToolSchema) error {
 	if len(calls) == 0 {
-		return
+		return nil
 	}
 	if !builder.response.ParallelToolCalls {
 		if builder.toolCount > 0 {
-			return
+			return nil
 		}
 		calls = calls[:1]
 	}
-	for index, item := range responseFunctionOutputs(calls, schemas) {
+	items, err := responseToolOutputs(calls, schemas, builder.response.ToolDefinitions)
+	if err != nil {
+		return err
+	}
+	for index, item := range items {
 		builder.toolCount++
 		builder.toolCalls = append(builder.toolCalls, calls[index])
 		outputIndex := len(builder.output)
 		added := cloneMap(item)
 		added["status"] = "in_progress"
-		added["arguments"] = ""
+		switch item["type"] {
+		case "function_call":
+			added["arguments"] = ""
+		case "custom_tool_call":
+			added["input"] = ""
+		}
 		writer.emit("response.output_item.added", map[string]any{"output_index": outputIndex, "item": added})
-		writer.emit("response.function_call_arguments.delta", map[string]any{
-			"item_id": item["id"], "output_index": outputIndex, "delta": item["arguments"],
-		})
-		writer.emit("response.function_call_arguments.done", map[string]any{
-			"item_id": item["id"], "output_index": outputIndex, "name": item["name"], "arguments": item["arguments"],
-		})
+		switch item["type"] {
+		case "function_call":
+			writer.emit("response.function_call_arguments.delta", map[string]any{
+				"item_id": item["id"], "output_index": outputIndex, "delta": item["arguments"],
+			})
+			writer.emit("response.function_call_arguments.done", map[string]any{
+				"item_id": item["id"], "output_index": outputIndex, "name": item["name"], "arguments": item["arguments"],
+			})
+		case "custom_tool_call":
+			writer.emit("response.custom_tool_call_input.delta", map[string]any{
+				"item_id": item["id"], "output_index": outputIndex, "delta": item["input"],
+			})
+			writer.emit("response.custom_tool_call_input.done", map[string]any{
+				"item_id": item["id"], "output_index": outputIndex, "input": item["input"],
+			})
+		}
 		writer.emit("response.output_item.done", map[string]any{"output_index": outputIndex, "item": item})
 		builder.output = append(builder.output, item)
 	}
+	return nil
 }
 
 func writeResponseError(w http.ResponseWriter, status int, message, errorType string, param, code any) {

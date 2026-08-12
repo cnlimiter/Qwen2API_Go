@@ -2,6 +2,7 @@ package openai
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -39,16 +40,16 @@ func TestNormalizeResponsesRequest(t *testing.T) {
 				{"type":"function_call","call_id":"call_1","name":"weather","arguments":"{\"city\":\"Hangzhou\"}"},
 				{"type":"function_call_output","call_id":"call_1","output":"sunny"}
 			]`),
-			Tools: []responseFunctionTool{{
-				Type: "function",
-				Name: "weather",
-				Parameters: map[string]any{
+			Tools: responseRawTools(t, map[string]any{
+				"type": "function",
+				"name": "weather",
+				"parameters": map[string]any{
 					"type": "object",
 					"properties": map[string]any{
 						"city": map[string]any{"type": "string"},
 					},
 				},
-			}},
+			}),
 			ToolChoice: map[string]any{"type": "function", "name": "weather"},
 		})
 		if err != nil {
@@ -148,6 +149,7 @@ func TestHandleResponseNonStreamFunctionCall(t *testing.T) {
 
 	handler.handleResponseNonStream(recorder, strings.NewReader(upstream), responseContext{
 		ID: "resp_tool", CreatedAt: 123, Model: "qwen3", Metadata: map[string]any{}, ParallelToolCalls: true, ToolChoice: "auto", Tools: []map[string]any{},
+		ToolDefinitions: []responseToolDefinition{{Type: responseToolFunction, Name: "weather", InternalName: "weather"}},
 	}, "qwen3", []string{"weather"}, schemas, 1)
 
 	var response map[string]any
@@ -216,6 +218,7 @@ func TestHandleResponseStreamFunctionCallEvents(t *testing.T) {
 
 	handler.handleResponseStream(recorder, strings.NewReader(upstream), responseContext{
 		ID: "resp_stream_tool", CreatedAt: 123, Model: "qwen3", Metadata: map[string]any{}, ParallelToolCalls: true, ToolChoice: "auto", Tools: []map[string]any{},
+		ToolDefinitions: []responseToolDefinition{{Type: responseToolFunction, Name: "weather", InternalName: "weather"}},
 	}, "qwen3", []string{"weather"}, []toolcall.ToolSchema{{Name: "weather", Parameters: map[string]any{"type": "object"}}}, 1)
 
 	events := decodeResponseEvents(t, recorder.Body.String())
@@ -243,6 +246,322 @@ func TestHandleResponseStreamFunctionCallEvents(t *testing.T) {
 	}
 }
 
+func TestNormalizeResponseToolsSupportsCodexLocalToolSet(t *testing.T) {
+	normalized := normalizeMixedResponseTools(t)
+	if len(normalized.ChatTools) != 5 || len(normalized.ResponseTools) != 5 || len(normalized.ToolDefinitions) != 5 {
+		t.Fatalf("normalized tools lengths = chat:%d response:%d definitions:%d", len(normalized.ChatTools), len(normalized.ResponseTools), len(normalized.ToolDefinitions))
+	}
+	seenInternal := make(map[string]struct{}, len(normalized.ToolDefinitions))
+	for _, definition := range normalized.ToolDefinitions {
+		if _, exists := seenInternal[definition.InternalName]; exists {
+			t.Fatalf("duplicate internal name %q", definition.InternalName)
+		}
+		seenInternal[definition.InternalName] = struct{}{}
+		if definition.Type != responseToolFunction && definition.InternalName == definition.Name {
+			t.Fatalf("%s internal name was not isolated: %#v", definition.Type, definition)
+		}
+	}
+
+	customEcho := normalized.ResponseTools[1]
+	format := customEcho["format"].(map[string]any)
+	if customEcho["name"] != "freeform" || format["type"] != "grammar" || format["syntax"] != "regex" || format["definition"] != `^[a-z]+$` {
+		t.Fatalf("custom echo lost caller fields: %#v", customEcho)
+	}
+	for _, echoed := range normalized.ResponseTools {
+		if _, exists := echoed["function"]; exists {
+			t.Fatalf("response tool leaked synthetic schema: %#v", echoed)
+		}
+	}
+}
+
+func TestNormalizeResponseToolsAvoidsSyntheticNameCollisions(t *testing.T) {
+	_, _, registry, err := normalizeResponseTools(responseRawTools(t,
+		map[string]any{"type": "function", "name": "freeform", "parameters": map[string]any{"type": "object"}},
+		map[string]any{"type": "custom", "name": "freeform", "format": map[string]any{"type": "text"}},
+		map[string]any{"type": "function", "name": "__responses_custom_1", "parameters": map[string]any{"type": "object"}},
+	))
+	if err != nil {
+		t.Fatalf("normalizeResponseTools() error = %v", err)
+	}
+	publicFunctionName := registry.internalName(responseToolFunction, "freeform")
+	collisionFunctionName := registry.internalName(responseToolFunction, "__responses_custom_1")
+	customName := registry.internalName(responseToolCustom, "freeform")
+	if publicFunctionName != "freeform" || customName != "__responses_custom_1_1" || collisionFunctionName == customName {
+		t.Fatalf("collision mapping = public function:%q collision function:%q custom:%q", publicFunctionName, collisionFunctionName, customName)
+	}
+}
+
+func TestNormalizeResponseInputSupportsLocalToolRoundTrips(t *testing.T) {
+	input := json.RawMessage(`[
+		{"type":"function_call","call_id":"call_f","name":"weather","arguments":"{\"city\":\"Hangzhou\"}"},
+		{"type":"function_call_output","call_id":"call_f","output":"sunny"},
+		{"type":"custom_tool_call","call_id":"call_c","name":"freeform","input":"alpha"},
+		{"type":"custom_tool_call_output","call_id":"call_c","output":"accepted"},
+		{"type":"local_shell_call","call_id":"call_l","action":{"type":"exec","command":["git","status"],"timeout_ms":1000,"working_directory":"repo","env":{"A":"B"},"user":"codex"}},
+		{"type":"local_shell_call_output","call_id":"call_l","output":"{\"stdout\":\"clean\"}"},
+		{"type":"shell_call","call_id":"call_s","action":{"commands":["pwd","git status"],"timeout_ms":1000,"max_output_length":4096}},
+		{"type":"shell_call_output","call_id":"call_s","output":[{"stdout":"repo","stderr":"","outcome":{"type":"exit","exit_code":0}}]},
+		{"type":"apply_patch_call","call_id":"call_a","operation":{"type":"update_file","path":"a.txt","diff":"@@ -1 +1 @@\n-old\n+new"}},
+		{"type":"apply_patch_call_output","call_id":"call_a","status":"completed","output":"Done"}
+	]`)
+	tools := mixedResponseRawTools(t)
+	normalized, err := normalizeResponsesRequest(responsesRequest{Model: "qwen3", Input: input, Tools: tools})
+	if err != nil {
+		t.Fatalf("normalizeResponsesRequest() error = %v", err)
+	}
+	if len(normalized.Messages) != 10 {
+		t.Fatalf("messages len = %d, want 10", len(normalized.Messages))
+	}
+	for index := 0; index < len(normalized.Messages); index += 2 {
+		assistant := normalized.Messages[index]
+		call := assistant["tool_calls"].([]any)[0].(map[string]any)
+		function := call["function"].(map[string]any)
+		result := normalized.Messages[index+1]
+		if result["role"] != "tool" || result["tool_call_id"] != call["id"] || result["name"] != function["name"] {
+			t.Fatalf("round-trip messages %d/%d are not linked: assistant=%#v result=%#v", index, index+1, assistant, result)
+		}
+	}
+}
+
+func TestNormalizeResponseInputRejectsToolCallAssociationErrors(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{
+			name:  "unknown call id",
+			input: `[{"type":"custom_tool_call_output","call_id":"missing","output":"x"}]`,
+		},
+		{
+			name:  "mismatched output type",
+			input: `[{"type":"custom_tool_call","call_id":"call_1","name":"freeform","input":"x"},{"type":"function_call_output","call_id":"call_1","output":"x"}]`,
+		},
+		{
+			name:  "duplicate output",
+			input: `[{"type":"custom_tool_call","call_id":"call_1","name":"freeform","input":"x"},{"type":"custom_tool_call_output","call_id":"call_1","output":"x"},{"type":"custom_tool_call_output","call_id":"call_1","output":"x"}]`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := normalizeResponsesRequest(responsesRequest{Model: "qwen3", Input: json.RawMessage(tt.input), Tools: mixedResponseRawTools(t)}); err == nil {
+				t.Fatal("normalizeResponsesRequest() error = nil, want association error")
+			}
+		})
+	}
+}
+
+func TestHandleResponseNonStreamNativeToolCalls(t *testing.T) {
+	normalized := normalizeMixedResponseTools(t)
+	tests := []struct {
+		name       string
+		toolType   string
+		parameters string
+		assert     func(*testing.T, map[string]any)
+	}{
+		{
+			name:       "custom",
+			toolType:   responseToolCustom,
+			parameters: `<input><![CDATA[alpha]]></input>`,
+			assert: func(t *testing.T, item map[string]any) {
+				if item["type"] != "custom_tool_call" || item["name"] != "freeform" || item["input"] != "alpha" {
+					t.Fatalf("custom item = %#v", item)
+				}
+			},
+		},
+		{
+			name:       "local shell",
+			toolType:   responseToolLocalShell,
+			parameters: `<command><![CDATA[["git","status"]]]></command><timeout_ms><![CDATA[1000]]></timeout_ms><env><![CDATA[{"A":"B"}]]></env>`,
+			assert: func(t *testing.T, item map[string]any) {
+				action := item["action"].(map[string]any)
+				if item["type"] != "local_shell_call" || action["type"] != "exec" || !reflect.DeepEqual(action["command"], []any{"git", "status"}) || action["timeout_ms"] != float64(1000) {
+					t.Fatalf("local shell item = %#v", item)
+				}
+			},
+		},
+		{
+			name:       "shell",
+			toolType:   responseToolShell,
+			parameters: `<commands><![CDATA[["pwd","git status"]]]></commands><max_output_length><![CDATA[4096]]></max_output_length>`,
+			assert: func(t *testing.T, item map[string]any) {
+				action := item["action"].(map[string]any)
+				if item["type"] != "shell_call" || !reflect.DeepEqual(action["commands"], []any{"pwd", "git status"}) || action["max_output_length"] != float64(4096) {
+					t.Fatalf("shell item = %#v", item)
+				}
+			},
+		},
+		{
+			name:     "apply patch",
+			toolType: responseToolApplyPatch,
+			parameters: `<operation><![CDATA[update_file]]></operation><path><![CDATA[a.txt]]></path><diff><![CDATA[@@ -1 +1 @@
+-old
++new]]></diff>`,
+			assert: func(t *testing.T, item map[string]any) {
+				operation := item["operation"].(map[string]any)
+				if item["type"] != "apply_patch_call" || operation["type"] != "update_file" || operation["path"] != "a.txt" {
+					t.Fatalf("apply patch item = %#v", item)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			definition := responseDefinition(t, normalized.ToolDefinitions, tt.toolType)
+			content := fmt.Sprintf("<tool_calls><tool_call><tool_name>%s</tool_name><parameters>%s</parameters></tool_call></tool_calls>", definition.InternalName, tt.parameters)
+			rawUpstream, err := json.Marshal(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"role": "assistant", "content": content}}}})
+			if err != nil {
+				t.Fatalf("json.Marshal(upstream) error = %v", err)
+			}
+			recorder := httptest.NewRecorder()
+			responseTestHandler().handleResponseNonStream(recorder, strings.NewReader(string(rawUpstream)), responseContext{
+				ID: "resp_native", CreatedAt: 123, Model: "qwen3", Metadata: map[string]any{}, ParallelToolCalls: true,
+				ToolChoice: "auto", Tools: normalized.ResponseTools, ToolDefinitions: normalized.ToolDefinitions,
+			}, "qwen3", responseToolNames(normalized.ToolDefinitions), responseSchemas(normalized.ChatTools), 1)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+			}
+			var response map[string]any
+			decodeJSONForTest(t, recorder.Body.String(), &response)
+			output := response["output"].([]any)
+			if len(output) != 1 {
+				t.Fatalf("output len = %d, want 1: %#v", len(output), output)
+			}
+			item := output[0].(map[string]any)
+			if item["status"] != "completed" || !strings.HasPrefix(item["call_id"].(string), "call_") {
+				t.Fatalf("native item identifiers/status = %#v", item)
+			}
+			tt.assert(t, item)
+		})
+	}
+}
+
+func TestHandleResponseStreamCustomToolCallEvents(t *testing.T) {
+	normalized := normalizeMixedResponseTools(t)
+	definition := responseDefinition(t, normalized.ToolDefinitions, responseToolCustom)
+	upstream := fmt.Sprintf("data: {\"choices\":[{\"delta\":{\"content\":\"<tool_calls><tool_call><tool_name>%s</tool_name><parameters><input><![CDATA[alpha]]></input></parameters></tool_call></tool_calls>\"}}]}\n\ndata: [DONE]\n\n", definition.InternalName)
+	recorder := httptest.NewRecorder()
+	responseTestHandler().handleResponseStream(recorder, strings.NewReader(upstream), responseContext{
+		ID: "resp_custom_stream", CreatedAt: 123, Model: "qwen3", Metadata: map[string]any{}, ParallelToolCalls: true,
+		ToolChoice: "auto", Tools: normalized.ResponseTools, ToolDefinitions: normalized.ToolDefinitions,
+	}, "qwen3", responseToolNames(normalized.ToolDefinitions), responseSchemas(normalized.ChatTools), 1)
+
+	events := decodeResponseEvents(t, recorder.Body.String())
+	assertResponseEventTypes(t, events, []string{
+		"response.created", "response.in_progress", "response.output_item.added",
+		"response.custom_tool_call_input.delta", "response.custom_tool_call_input.done",
+		"response.output_item.done", "response.completed",
+	})
+	added := events[2]["item"].(map[string]any)
+	doneItem := events[5]["item"].(map[string]any)
+	completed := events[6]["response"].(map[string]any)
+	completedItem := completed["output"].([]any)[0].(map[string]any)
+	if added["type"] != "custom_tool_call" || added["status"] != "in_progress" || added["input"] != "" {
+		t.Fatalf("custom added item = %#v", added)
+	}
+	if events[3]["delta"] != "alpha" || events[4]["input"] != "alpha" || !reflect.DeepEqual(doneItem, completedItem) {
+		t.Fatalf("custom stream events/items mismatch: %#v", events[3:])
+	}
+}
+
+func TestHandleResponseStreamNativeToolCallItems(t *testing.T) {
+	normalized := normalizeMixedResponseTools(t)
+	tests := []struct {
+		toolType   string
+		parameters string
+		itemType   string
+	}{
+		{responseToolLocalShell, `<command><![CDATA[["pwd"]]]></command>`, "local_shell_call"},
+		{responseToolShell, `<commands><![CDATA[["pwd"]]]></commands>`, "shell_call"},
+		{responseToolApplyPatch, `<operation><![CDATA[delete_file]]></operation><path><![CDATA[old.txt]]></path>`, "apply_patch_call"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.toolType, func(t *testing.T) {
+			definition := responseDefinition(t, normalized.ToolDefinitions, tt.toolType)
+			content := fmt.Sprintf("<tool_calls><tool_call><tool_name>%s</tool_name><parameters>%s</parameters></tool_call></tool_calls>", definition.InternalName, tt.parameters)
+			delta, err := json.Marshal(map[string]any{"choices": []any{map[string]any{"delta": map[string]any{"content": content}}}})
+			if err != nil {
+				t.Fatalf("json.Marshal(delta) error = %v", err)
+			}
+			upstream := fmt.Sprintf("data: %s\n\ndata: [DONE]\n\n", delta)
+			recorder := httptest.NewRecorder()
+			responseTestHandler().handleResponseStream(recorder, strings.NewReader(upstream), responseContext{
+				ID: "resp_native_stream", CreatedAt: 123, Model: "qwen3", Metadata: map[string]any{}, ParallelToolCalls: true,
+				ToolChoice: "auto", Tools: normalized.ResponseTools, ToolDefinitions: normalized.ToolDefinitions,
+			}, "qwen3", responseToolNames(normalized.ToolDefinitions), responseSchemas(normalized.ChatTools), 1)
+			events := decodeResponseEvents(t, recorder.Body.String())
+			assertResponseEventTypes(t, events, []string{
+				"response.created", "response.in_progress", "response.output_item.added", "response.output_item.done", "response.completed",
+			})
+			added := events[2]["item"].(map[string]any)
+			done := events[3]["item"].(map[string]any)
+			completed := events[4]["response"].(map[string]any)["output"].([]any)[0].(map[string]any)
+			if added["type"] != tt.itemType || added["status"] != "in_progress" || done["status"] != "completed" || !reflect.DeepEqual(done, completed) {
+				t.Fatalf("native stream item mismatch: added=%#v done=%#v completed=%#v", added, done, completed)
+			}
+		})
+	}
+}
+
+func TestNormalizeResponseToolChoiceSupportsLocalToolTypes(t *testing.T) {
+	normalized := normalizeMixedResponseTools(t)
+	registry := registryFromDefinitions(normalized.ToolDefinitions)
+	tests := []map[string]any{
+		{"type": "function", "name": "weather"},
+		{"type": "custom", "name": "freeform"},
+		{"type": "local_shell"},
+		{"type": "shell"},
+		{"type": "apply_patch"},
+	}
+	for _, choice := range tests {
+		choice := choice
+		t.Run(stringValue(choice["type"]), func(t *testing.T) {
+			chatChoice, responseChoice, err := normalizeResponseToolChoice(choice, registry)
+			if err != nil {
+				t.Fatalf("normalizeResponseToolChoice() error = %v", err)
+			}
+			internal := chatChoice.(map[string]any)["function"].(map[string]any)["name"]
+			if internal == "" || !reflect.DeepEqual(responseChoice, choice) {
+				t.Fatalf("tool choice mapping = chat:%#v response:%#v", chatChoice, responseChoice)
+			}
+		})
+	}
+	if _, _, err := normalizeResponseToolChoice(map[string]any{"type": "custom", "name": "weather"}, registry); err == nil {
+		t.Fatal("type-mismatched custom choice error = nil")
+	}
+}
+
+func TestNormalizeResponseToolsRejectsHostedExecutionTools(t *testing.T) {
+	for _, toolType := range []string{"file_search", "web_search_preview", "computer_use_preview", "code_interpreter", "image_generation", "mcp"} {
+		t.Run(toolType, func(t *testing.T) {
+			_, _, _, err := normalizeResponseTools(responseRawTools(t, map[string]any{"type": toolType}))
+			if err == nil || !strings.Contains(err.Error(), "hosted execution") {
+				t.Fatalf("normalizeResponseTools() error = %v, want hosted execution error", err)
+			}
+		})
+	}
+}
+
+func TestNormalizeResponseToolsValidatesCustomFormats(t *testing.T) {
+	tests := []struct {
+		name    string
+		format  map[string]any
+		wantErr bool
+	}{
+		{name: "text", format: map[string]any{"type": "text"}},
+		{name: "lark grammar", format: map[string]any{"type": "grammar", "syntax": "lark", "definition": `start: WORD`}},
+		{name: "invalid grammar syntax", format: map[string]any{"type": "grammar", "syntax": "peg", "definition": `word`}, wantErr: true},
+		{name: "missing grammar definition", format: map[string]any{"type": "grammar", "syntax": "regex"}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, _, err := normalizeResponseTools(responseRawTools(t, map[string]any{"type": "custom", "name": "freeform", "format": tt.format}))
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("normalizeResponseTools() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestHandleResponsesInvalidInputErrorEnvelope(t *testing.T) {
 	handler := &Handler{}
 	recorder := httptest.NewRecorder()
@@ -261,11 +580,107 @@ func TestHandleResponsesInvalidInputErrorEnvelope(t *testing.T) {
 	}
 }
 
+func TestHandleResponsesRejectsHostedToolWithExplicitError(t *testing.T) {
+	handler := &Handler{}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"qwen3","input":"search","tools":[{"type":"web_search_preview"}]}`))
+
+	handler.HandleResponses(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+	var payload map[string]any
+	decodeJSONForTest(t, recorder.Body.String(), &payload)
+	errorObject := payload["error"].(map[string]any)
+	if errorObject["type"] != "invalid_request_error" || errorObject["param"] != "tools" || !strings.Contains(stringValue(errorObject["message"]), "hosted execution") {
+		t.Fatalf("hosted tool error envelope = %#v", errorObject)
+	}
+}
+
 func responseTestHandler() *Handler {
 	return &Handler{
 		logger:  logging.New(false),
 		metrics: metrics.NewDashboardStats(),
 	}
+}
+
+func mixedResponseRawTools(t *testing.T) []json.RawMessage {
+	t.Helper()
+	return responseRawTools(t,
+		map[string]any{
+			"type":        "function",
+			"name":        "weather",
+			"description": "Get weather",
+			"parameters":  map[string]any{"type": "object", "properties": map[string]any{"city": map[string]any{"type": "string"}}},
+		},
+		map[string]any{
+			"type":        "custom",
+			"name":        "freeform",
+			"description": "Accept a word",
+			"format":      map[string]any{"type": "grammar", "syntax": "regex", "definition": `^[a-z]+$`},
+		},
+		map[string]any{"type": "local_shell"},
+		map[string]any{"type": "shell", "environment": map[string]any{"type": "local"}},
+		map[string]any{"type": "apply_patch"},
+	)
+}
+
+func normalizeMixedResponseTools(t *testing.T) normalizedResponsesRequest {
+	t.Helper()
+	normalized, err := normalizeResponsesRequest(responsesRequest{
+		Model: "qwen3",
+		Input: json.RawMessage(`"use a tool"`),
+		Tools: mixedResponseRawTools(t),
+	})
+	if err != nil {
+		t.Fatalf("normalizeResponsesRequest() error = %v", err)
+	}
+	return normalized
+}
+
+func responseDefinition(t *testing.T, definitions []responseToolDefinition, toolType string) responseToolDefinition {
+	t.Helper()
+	for _, definition := range definitions {
+		if definition.Type == toolType {
+			return definition
+		}
+	}
+	t.Fatalf("missing %s definition in %#v", toolType, definitions)
+	return responseToolDefinition{}
+}
+
+func responseToolNames(definitions []responseToolDefinition) []string {
+	result := make([]string, len(definitions))
+	for index, definition := range definitions {
+		result[index] = definition.InternalName
+	}
+	return result
+}
+
+func responseSchemas(chatTools []any) []toolcall.ToolSchema {
+	result := make([]toolcall.ToolSchema, 0, len(chatTools))
+	for _, raw := range chatTools {
+		tool := raw.(map[string]any)
+		function := tool["function"].(map[string]any)
+		result = append(result, toolcall.ToolSchema{
+			Name:        stringValue(function["name"]),
+			Description: stringValue(function["description"]),
+			Parameters:  function["parameters"].(map[string]any),
+		})
+	}
+	return result
+}
+
+func registryFromDefinitions(definitions []responseToolDefinition) responseToolRegistry {
+	registry := responseToolRegistry{
+		definitions: append([]responseToolDefinition(nil), definitions...),
+		byTypeName:  make(map[string]responseToolDefinition, len(definitions)),
+	}
+	for _, definition := range definitions {
+		registry.byTypeName[responseToolKey(definition.Type, definition.Name)] = definition
+	}
+	return registry
 }
 
 func decodeJSONForTest(t *testing.T, raw string, target any) {
@@ -304,4 +719,17 @@ func assertResponseEventTypes(t *testing.T, events []map[string]any, want []stri
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("event types = %#v, want %#v", got, want)
 	}
+}
+
+func responseRawTools(t *testing.T, tools ...map[string]any) []json.RawMessage {
+	t.Helper()
+	result := make([]json.RawMessage, len(tools))
+	for index, tool := range tools {
+		raw, err := json.Marshal(tool)
+		if err != nil {
+			t.Fatalf("json.Marshal(tool) error = %v", err)
+		}
+		result[index] = raw
+	}
+	return result
 }
