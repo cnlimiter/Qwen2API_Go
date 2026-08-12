@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.0](https://github.com/cnlimiter/Qwen2API_Go/compare/v1.1.1...v1.2.0) (2026-08-12)
+
+
+### Features
+
+* add OpenAI Responses API support ([ff4af63](https://github.com/cnlimiter/Qwen2API_Go/commit/ff4af63839eeed06ff331beff82a0d0f4090146a))
+
 ## [1.1.1](https://github.com/XxxXTeam/Qwen2API_Go/compare/v1.1.0...v1.1.1) (2026-07-03)
 
 
