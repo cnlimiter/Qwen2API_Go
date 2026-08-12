@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.1](https://github.com/cnlimiter/Qwen2API_Go/compare/v1.2.0...v1.2.1) (2026-08-12)
+
+
+### Bug Fixes
+
+* support Codex Responses tools ([266ff15](https://github.com/cnlimiter/Qwen2API_Go/commit/266ff154d401fe1169d58a676d7e5ffb6eb4bfcd))
+
 ## [1.2.0](https://github.com/cnlimiter/Qwen2API_Go/compare/v1.1.1...v1.2.0) (2026-08-12)
 
 
