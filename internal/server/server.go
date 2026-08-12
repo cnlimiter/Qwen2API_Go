@@ -90,6 +90,7 @@ func New(cfg config.Config, keyring *auth.Keyring, openAIHandler *openai.Handler
 	handle("/models", "models", ensureMethod(http.MethodGet, openAIHandler.HandleModels))
 	handle("/v1/models", "models", ensureMethod(http.MethodGet, withAnyKey(openAIHandler.HandleModels)))
 	handle("/v1/chat/completions", "chat", ensureMethod(http.MethodPost, withAnyKey(openAIHandler.HandleChatCompletion)))
+	handle("/v1/responses", "chat", ensureMethod(http.MethodPost, withAnyKey(openAIHandler.HandleResponses)))
 	handle("/v1/messages", "chat", ensureMethod(http.MethodPost, withAnthropicKey(openAIHandler.HandleAnthropicMessages)))
 	handle("/v1/messages/count_tokens", "chat", ensureMethod(http.MethodPost, withAnthropicKey(openAIHandler.HandleAnthropicCountTokens)))
 	handle("/v1/images/generations", "image", ensureMethod(http.MethodPost, withAnyKey(openAIHandler.HandleImagesGeneration)))
@@ -184,6 +185,12 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 	written, err := s.ResponseWriter.Write(b)
 	s.bytesWritten += written
 	return written, err
+}
+
+func (s *statusRecorder) Flush() {
+	if flusher, ok := s.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }
 
 func cors(next http.Handler) http.Handler {

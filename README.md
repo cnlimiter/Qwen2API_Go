@@ -174,6 +174,22 @@ curl http://127.0.0.1:3000/v1/chat/completions \
   }'
 ```
 
+### OpenAI Responses
+
+`input` 支持字符串或 Responses input item 数组，函数工具使用 Responses API 的扁平定义格式。
+
+```bash
+curl http://127.0.0.1:3000/v1/responses \
+  -H "Authorization: Bearer sk-admin-change-me" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3-235b-a22b",
+    "instructions": "回答要简洁",
+    "input": "你好",
+    "stream": false
+  }'
+```
+
 ### Anthropic Messages
 
 支持 `x-api-key` 和 `Authorization: Bearer ...` 两种鉴权方式。
