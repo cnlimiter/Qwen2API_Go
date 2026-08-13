@@ -21,6 +21,7 @@ type executedChatRequest struct {
 	NestedReasoningEffort any
 	Tools                 any
 	ToolChoice            any
+	ChatType              string
 	Size                  string
 }
 
@@ -126,6 +127,9 @@ func (h *Handler) executeChatRequest(ctx context.Context, payload executedChatRe
 
 func (h *Handler) prepareChatRequest(ctx context.Context, payload executedChatRequest) preparedChatRequest {
 	chatType := chatTypeForModel(payload.Model)
+	if strings.TrimSpace(payload.ChatType) != "" {
+		chatType = strings.TrimSpace(payload.ChatType)
+	}
 	model, _ := h.ResolveModel(ctx, payload.Model, chatType)
 	thinkingMode := resolveThinkingMode(payload.Model, payload.ReasoningEffort, payload.NestedReasoningEffort, payload.EnableThinking)
 	messages := injectQwenWeb2ControlPrompt(payload.Messages, h.qwenWeb2ControlPrompt())

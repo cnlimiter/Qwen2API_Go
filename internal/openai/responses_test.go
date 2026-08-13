@@ -534,11 +534,151 @@ func TestNormalizeResponseToolChoiceSupportsLocalToolTypes(t *testing.T) {
 }
 
 func TestNormalizeResponseToolsRejectsHostedExecutionTools(t *testing.T) {
-	for _, toolType := range []string{"file_search", "web_search_preview", "computer_use_preview", "code_interpreter", "image_generation", "mcp"} {
+	for _, toolType := range []string{"file_search", "web_search_preview", "computer_use_preview", "code_interpreter", "image_generation", "mcp", "tool_search"} {
 		t.Run(toolType, func(t *testing.T) {
 			_, _, _, err := normalizeResponseTools(responseRawTools(t, map[string]any{"type": toolType}))
 			if err == nil || !strings.Contains(err.Error(), "hosted execution") {
 				t.Fatalf("normalizeResponseTools() error = %v, want hosted execution error", err)
+			}
+		})
+	}
+}
+
+func TestNormalizeResponseWebSearchCodexDescriptors(t *testing.T) {
+	tests := []struct {
+		name     string
+		tool     map[string]any
+		chatType string
+	}{
+		{name: "native search", tool: map[string]any{"type": "web_search"}, chatType: "search"},
+		{name: "empty filters", tool: map[string]any{"type": "web_search", "filters": map[string]any{}}, chatType: "search"},
+		{name: "empty allowed domains", tool: map[string]any{"type": "web_search", "filters": map[string]any{"allowed_domains": []any{}}}, chatType: "search"},
+		{name: "actual Codex cached search", tool: map[string]any{"type": "web_search", "external_web_access": false}, chatType: "t2t"},
+		{
+			name: "current Codex constrained search",
+			tool: map[string]any{
+				"type": "web_search", "external_web_access": true, "indexed_web_access": false,
+				"filters":              map[string]any{"allowed_domains": []any{"example.com"}},
+				"search_context_size":  "high",
+				"user_location":        map[string]any{"type": "approximate", "country": "US", "city": "New York", "timezone": "America/New_York"},
+				"search_content_types": []any{"text", "image"},
+			},
+			chatType: "t2t",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			normalized, err := normalizeResponsesRequest(responsesRequest{
+				Model: "qwen3", Input: json.RawMessage(`"search"`), Tools: responseRawTools(t, tt.tool),
+			})
+			if err != nil {
+				t.Fatalf("normalizeResponsesRequest() error = %v", err)
+			}
+			if normalized.ChatType != tt.chatType {
+				t.Fatalf("ChatType = %q, want %q", normalized.ChatType, tt.chatType)
+			}
+			if len(normalized.ChatTools) != 0 || len(normalized.ToolDefinitions) != 0 {
+				t.Fatalf("hosted web search leaked into client registry: chat=%#v definitions=%#v", normalized.ChatTools, normalized.ToolDefinitions)
+			}
+			if len(normalized.ResponseTools) != 1 || !reflect.DeepEqual(normalized.ResponseTools[0], tt.tool) {
+				t.Fatalf("web search echo = %#v, want %#v", normalized.ResponseTools, tt.tool)
+			}
+		})
+	}
+}
+
+func TestNormalizeResponseWebSearchRejectsMalformedDefinitions(t *testing.T) {
+	for name, tool := range map[string]map[string]any{
+		"unknown field":         {"type": "web_search", "unknown": true},
+		"non boolean access":    {"type": "web_search", "external_web_access": "false"},
+		"invalid domains":       {"type": "web_search", "filters": map[string]any{"allowed_domains": []any{""}}},
+		"invalid location type": {"type": "web_search", "user_location": map[string]any{"type": "exact"}},
+		"invalid context size":  {"type": "web_search", "search_context_size": "huge"},
+		"invalid content type":  {"type": "web_search", "search_content_types": []any{"video"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, _, err := normalizeResponseTools(responseRawTools(t, tool)); err == nil {
+				t.Fatal("normalizeResponseTools() error = nil, want malformed web_search error")
+			}
+		})
+	}
+}
+
+func TestNormalizeResponseWebSearchRejectsForcedExecution(t *testing.T) {
+	for name, choice := range map[string]any{
+		"required": "required",
+		"explicit": map[string]any{"type": "web_search"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := normalizeResponsesRequest(responsesRequest{
+				Model: "qwen3", Input: json.RawMessage(`"search"`),
+				Tools: responseRawTools(t, map[string]any{"type": "web_search", "external_web_access": false}), ToolChoice: choice,
+			})
+			if err == nil || !strings.Contains(err.Error(), "web_search_call") {
+				t.Fatalf("normalizeResponsesRequest() error = %v, want observable-call error", err)
+			}
+		})
+	}
+}
+
+func TestCodexFullToolSetPassesResponsesHandlerGate(t *testing.T) {
+	tools := append(mixedResponseRawTools(t), responseNamespaceRawTool(t))
+	tools = append(tools, responseRawTools(t, map[string]any{"type": "web_search", "external_web_access": false})...)
+	normalized, err := normalizeResponsesRequest(responsesRequest{Model: "qwen3", Input: json.RawMessage(`"use the available tools"`), Tools: tools})
+	if err != nil {
+		t.Fatalf("full Codex tool set normalization error = %v", err)
+	}
+	if len(normalized.ResponseTools) != 7 || len(normalized.ChatTools) != 7 || len(normalized.ToolDefinitions) != 7 {
+		t.Fatalf("full tool set lengths = response:%d chat:%d definitions:%d", len(normalized.ResponseTools), len(normalized.ChatTools), len(normalized.ToolDefinitions))
+	}
+	if normalized.ChatType != "t2t" {
+		t.Fatalf("external_web_access=false chat type = %q, want t2t", normalized.ChatType)
+	}
+	internalNames := make(map[string]struct{}, len(normalized.ToolDefinitions))
+	for _, definition := range normalized.ToolDefinitions {
+		if _, exists := internalNames[definition.InternalName]; exists {
+			t.Fatalf("duplicate internal name %q", definition.InternalName)
+		}
+		internalNames[definition.InternalName] = struct{}{}
+	}
+	if echoed := normalized.ResponseTools[len(normalized.ResponseTools)-1]; echoed["type"] != "web_search" || echoed["external_web_access"] != false {
+		t.Fatalf("web_search echo = %#v", echoed)
+	}
+
+	requestBody, err := json.Marshal(responsesRequest{Model: "qwen3", Input: json.RawMessage(`"use the available tools"`), Tools: tools})
+	if err != nil {
+		t.Fatalf("json.Marshal(request) error = %v", err)
+	}
+	logger := logging.New(false)
+	handler := &Handler{accounts: account.NewService(config.Config{}, nil, nil, nil, logger), logger: logger}
+	recorder := httptest.NewRecorder()
+	handler.HandleResponses(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(requestBody))))
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("handler status = %d body=%s, want 502 after passing request validation", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestResponseWebSearchSelectsQwenNativeSearchOnlyWhenCompatible(t *testing.T) {
+	logger := logging.New(false)
+	handler := &Handler{accounts: account.NewService(config.Config{}, nil, nil, nil, logger), logger: logger}
+	for name, tool := range map[string]map[string]any{
+		"native": {"type": "web_search"},
+		"cached": {"type": "web_search", "external_web_access": false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			normalized, err := normalizeResponsesRequest(responsesRequest{Model: "qwen3-search", Input: json.RawMessage(`"search"`), Tools: responseRawTools(t, tool)})
+			if err != nil {
+				t.Fatalf("normalizeResponsesRequest() error = %v", err)
+			}
+			prepared := handler.prepareChatRequest(context.Background(), executedChatRequest{
+				Model: "qwen3-search", Messages: normalized.Messages, Tools: normalized.ChatTools, ToolChoice: normalized.ChatToolChoice, ChatType: normalized.ChatType,
+			})
+			want := "t2t"
+			if name == "native" {
+				want = "search"
+			}
+			if prepared.ChatType != want {
+				t.Fatalf("prepared chat type = %q, want %q", prepared.ChatType, want)
 			}
 		})
 	}

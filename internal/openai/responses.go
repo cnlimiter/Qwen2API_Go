@@ -27,12 +27,14 @@ type responsesRequest struct {
 }
 
 const (
-	responseToolFunction   = "function"
-	responseToolCustom     = "custom"
-	responseToolLocalShell = "local_shell"
-	responseToolShell      = "shell"
-	responseToolApplyPatch = "apply_patch"
-	responseToolNamespace  = "namespace"
+	responseToolFunction           = "function"
+	responseToolCustom             = "custom"
+	responseToolLocalShell         = "local_shell"
+	responseToolShell              = "shell"
+	responseToolApplyPatch         = "apply_patch"
+	responseToolNamespace          = "namespace"
+	responseToolWebSearch          = "web_search"
+	responseToolWebSearchVersioned = "web_search_2025_08_26"
 )
 
 type responseToolDefinition struct {
@@ -45,6 +47,11 @@ type responseToolDefinition struct {
 type responseToolRegistry struct {
 	definitions []responseToolDefinition
 	byTypeName  map[string]responseToolDefinition
+	webSearch   *responseWebSearchTool
+}
+
+type responseWebSearchTool struct {
+	qwenSearchCompatible bool
 }
 
 type normalizedResponsesRequest struct {
@@ -55,6 +62,7 @@ type normalizedResponsesRequest struct {
 	ToolDefinitions []responseToolDefinition
 	ToolChoice      any
 	Parallel        bool
+	ChatType        string
 }
 
 type responseContext struct {
@@ -109,6 +117,7 @@ func (h *Handler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	executed, status, err := h.executeChatRequest(r.Context(), executedChatRequest{
 		Model:    payload.Model,
 		Messages: normalized.Messages,
+		ChatType: normalized.ChatType,
 		ReasoningEffort: func() any {
 			if payload.Reasoning == nil {
 				return nil
@@ -199,6 +208,13 @@ func normalizeResponsesRequest(payload responsesRequest) (normalizedResponsesReq
 	if payload.ParallelToolCalls != nil {
 		parallel = *payload.ParallelToolCalls
 	}
+	chatType := ""
+	if registry.webSearch != nil {
+		chatType = "t2t"
+		if registry.webSearch.qwenSearchCompatible && responseToolChoice == "auto" {
+			chatType = "search"
+		}
+	}
 	return normalizedResponsesRequest{
 		Messages:        messages,
 		ChatTools:       chatTools,
@@ -207,6 +223,7 @@ func normalizeResponsesRequest(payload responsesRequest) (normalizedResponsesReq
 		ToolDefinitions: registry.definitions,
 		ToolChoice:      responseToolChoice,
 		Parallel:        parallel,
+		ChatType:        chatType,
 	}, nil
 }
 
@@ -729,6 +746,20 @@ func normalizeResponseTools(tools []json.RawMessage) ([]any, []map[string]any, r
 		if !ok || toolType == "" {
 			return nil, nil, responseToolRegistry{}, responseToolError(fmt.Sprintf("tools[%d].type must be a non-empty string", index))
 		}
+		if isSupportedResponseWebSearch(toolType) {
+			webSearch, err := normalizeResponseWebSearch(tool, index)
+			if err != nil {
+				return nil, nil, responseToolRegistry{}, err
+			}
+			if registry.webSearch != nil {
+				return nil, nil, responseToolRegistry{}, responseToolError(fmt.Sprintf("tools[%d] duplicates web_search tool", index))
+			}
+			registry.webSearch = &webSearch
+			echo := cloneMap(tool)
+			echo["type"] = toolType
+			responseTools = append(responseTools, echo)
+			continue
+		}
 		if isHostedResponseTool(toolType) {
 			return nil, nil, responseToolRegistry{}, responseToolError(fmt.Sprintf("tools[%d].type %q requires OpenAI-hosted execution, which this backend cannot provide", index, toolType))
 		}
@@ -827,6 +858,116 @@ func normalizeResponseTools(tools []json.RawMessage) ([]any, []map[string]any, r
 		responseTools = append(responseTools, echo)
 	}
 	return chatTools, responseTools, registry, nil
+}
+
+func isSupportedResponseWebSearch(toolType string) bool {
+	return toolType == responseToolWebSearch || toolType == responseToolWebSearchVersioned
+}
+
+func normalizeResponseWebSearch(tool map[string]any, index int) (responseWebSearchTool, error) {
+	if err := validateResponseObjectKeys(tool,
+		"type", "external_web_access", "indexed_web_access", "filters", "user_location", "search_context_size", "search_content_types"); err != nil {
+		return responseWebSearchTool{}, responseToolError(fmt.Sprintf("tools[%d] %v", index, err))
+	}
+
+	compatible := true
+	for _, field := range []string{"external_web_access", "indexed_web_access"} {
+		if raw, exists := tool[field]; exists {
+			value, ok := raw.(bool)
+			if !ok {
+				return responseWebSearchTool{}, responseToolError(fmt.Sprintf("tools[%d].%s must be a boolean", index, field))
+			}
+			if (field == "external_web_access" && !value) || (field == "indexed_web_access" && value) {
+				compatible = false
+			}
+		}
+	}
+
+	if raw, exists := tool["filters"]; exists {
+		filters, ok := raw.(map[string]any)
+		if !ok {
+			return responseWebSearchTool{}, responseToolError(fmt.Sprintf("tools[%d].filters must be an object", index))
+		}
+		if err := validateResponseObjectKeys(filters, "allowed_domains"); err != nil {
+			return responseWebSearchTool{}, responseToolError(fmt.Sprintf("tools[%d].filters %v", index, err))
+		}
+		if rawDomains, exists := filters["allowed_domains"]; exists {
+			domains, ok := rawDomains.([]any)
+			if !ok || len(domains) > 100 {
+				return responseWebSearchTool{}, responseToolError(fmt.Sprintf("tools[%d].filters.allowed_domains must be an array with at most 100 entries", index))
+			}
+			if len(domains) > 0 {
+				if err := validateResponseStringArray(domains, 100, nil); err != nil {
+					return responseWebSearchTool{}, responseToolError(fmt.Sprintf("tools[%d].filters.allowed_domains %v", index, err))
+				}
+				compatible = false
+			}
+		}
+	}
+
+	if raw, exists := tool["user_location"]; exists {
+		location, ok := raw.(map[string]any)
+		if !ok {
+			return responseWebSearchTool{}, responseToolError(fmt.Sprintf("tools[%d].user_location must be an object", index))
+		}
+		if err := validateResponseObjectKeys(location, "type", "country", "region", "city", "timezone"); err != nil {
+			return responseWebSearchTool{}, responseToolError(fmt.Sprintf("tools[%d].user_location %v", index, err))
+		}
+		if rawType, exists := location["type"]; exists {
+			locationType, ok := rawType.(string)
+			if !ok || locationType != "approximate" {
+				return responseWebSearchTool{}, responseToolError(fmt.Sprintf("tools[%d].user_location.type must be approximate", index))
+			}
+		}
+		for _, field := range []string{"country", "region", "city", "timezone"} {
+			if rawValue, exists := location[field]; exists {
+				if _, ok := rawValue.(string); !ok {
+					return responseWebSearchTool{}, responseToolError(fmt.Sprintf("tools[%d].user_location.%s must be a string", index, field))
+				}
+			}
+		}
+		compatible = false
+	}
+
+	if raw, exists := tool["search_context_size"]; exists {
+		contextSize, ok := raw.(string)
+		if !ok || (contextSize != "low" && contextSize != "medium" && contextSize != "high") {
+			return responseWebSearchTool{}, responseToolError(fmt.Sprintf("tools[%d].search_context_size must be low, medium, or high", index))
+		}
+		compatible = false
+	}
+	if raw, exists := tool["search_content_types"]; exists {
+		if err := validateResponseStringArray(raw, 2, map[string]struct{}{"text": {}, "image": {}}); err != nil {
+			return responseWebSearchTool{}, responseToolError(fmt.Sprintf("tools[%d].search_content_types %v", index, err))
+		}
+		compatible = false
+	}
+	return responseWebSearchTool{qwenSearchCompatible: compatible}, nil
+}
+
+func validateResponseStringArray(raw any, maximum int, allowed map[string]struct{}) error {
+	values, ok := raw.([]any)
+	if !ok || len(values) == 0 || len(values) > maximum {
+		return fmt.Errorf("must be a non-empty array with at most %d entries", maximum)
+	}
+	seen := make(map[string]struct{}, len(values))
+	for _, rawValue := range values {
+		value, ok := rawValue.(string)
+		value = strings.TrimSpace(value)
+		if !ok || value == "" {
+			return errors.New("entries must be non-empty strings")
+		}
+		if allowed != nil {
+			if _, ok := allowed[value]; !ok {
+				return errors.New("contains an unsupported value")
+			}
+		}
+		if _, exists := seen[value]; exists {
+			return errors.New("must not contain duplicate entries")
+		}
+		seen[value] = struct{}{}
+	}
+	return nil
 }
 
 func normalizeResponseNamespace(tool map[string]any, toolIndex int, usedInternalNames map[string]struct{}, registry *responseToolRegistry) ([]any, error) {
@@ -977,6 +1118,9 @@ func normalizeResponseToolChoice(raw any, registry responseToolRegistry) (any, a
 			return choice, choice, nil
 		case "required":
 			if len(registry.definitions) == 0 {
+				if registry.webSearch != nil {
+					return nil, nil, responseToolChoiceError("tool_choice required cannot be honored because this backend cannot expose a web_search_call")
+				}
 				return nil, nil, responseToolChoiceError("tool_choice required needs at least one tool")
 			}
 			return choice, choice, nil
@@ -988,6 +1132,15 @@ func normalizeResponseToolChoice(raw any, registry responseToolRegistry) (any, a
 		toolType := strings.ToLower(strings.TrimSpace(rawType))
 		if !ok || toolType == "" {
 			return nil, nil, responseToolChoiceError("tool_choice.type must be a non-empty string")
+		}
+		if isSupportedResponseWebSearch(toolType) {
+			if err := validateResponseObjectKeys(value, "type"); err != nil {
+				return nil, nil, responseToolChoiceError(fmt.Sprintf("tool_choice %v", err))
+			}
+			if registry.webSearch == nil {
+				return nil, nil, responseToolChoiceError("tool_choice does not reference a provided web_search tool")
+			}
+			return nil, nil, responseToolChoiceError("tool_choice web_search cannot be forced because this backend cannot expose a web_search_call")
 		}
 		if isHostedResponseTool(toolType) {
 			return nil, nil, responseToolChoiceError(fmt.Sprintf("tool_choice.type %q requires OpenAI-hosted execution, which this backend cannot provide", toolType))
