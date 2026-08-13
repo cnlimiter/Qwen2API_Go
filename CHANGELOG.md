@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.3](https://github.com/cnlimiter/Qwen2API_Go/compare/v1.2.2...v1.2.3) (2026-08-13)
+
+
+### Bug Fixes
+
+* support Responses web search ([6758488](https://github.com/cnlimiter/Qwen2API_Go/commit/67584885fd8c2fbbb60ba55149087bb8913d8598))
+
 ## [1.2.2](https://github.com/cnlimiter/Qwen2API_Go/compare/v1.2.1...v1.2.2) (2026-08-12)
 
 
